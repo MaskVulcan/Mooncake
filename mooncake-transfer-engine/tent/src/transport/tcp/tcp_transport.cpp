@@ -202,6 +202,21 @@ Status TcpTransport::getTransferStatus(SubBatchRef batch, int task_id,
     return Status::OK();
 }
 
+Status TcpTransport::getSubBatchDrainStatus(SubBatchRef batch, bool &drained) {
+    drained = false;
+    auto *tcp_batch = dynamic_cast<TcpSubBatch *>(batch);
+    if (!tcp_batch)
+        return Status::InvalidArgument("Invalid TCP sub-batch" LOC_MARK);
+    for (const auto &task : tcp_batch->task_list) {
+        auto status = task.status_word.load(std::memory_order_acquire);
+        if (status != COMPLETED && status != FAILED) return Status::OK();
+    }
+    // startTransfer publishes terminal only after the last local buffer access.
+    // A lost WRITE reply affects the remote result, not this local barrier.
+    drained = true;
+    return Status::OK();
+}
+
 Status TcpTransport::addMemoryBuffer(BufferDesc &desc,
                                      const MemoryOptions &options) {
     desc.transports.push_back(TransportType::TCP);

@@ -141,6 +141,19 @@ class FakeTransport : public Transport {
         return Status::OK();
     }
 
+    Status getSubBatchDrainStatus(SubBatchRef batch, bool& drained) override {
+        drained = false;
+        for (size_t id = 0; id < batch->size(); ++id) {
+            TransferStatus status{PENDING, 0};
+            auto result = getTransferStatus(batch, id, status);
+            if (!result.ok()) return result;
+            if (status.s == PENDING || status.s == INITIAL) return Status::OK();
+        }
+        // This CPU fixture has no device work after a terminal poll result.
+        drained = true;
+        return Status::OK();
+    }
+
     Status addMemoryBuffer(BufferDesc& desc,
                            const MemoryOptions& /*options*/) override {
         ++add_mem_calls;
@@ -1029,6 +1042,52 @@ TEST(ProxyManager, RetainsBatchToPreventSlabReuseLeak) {
         engine.freeBatch(new_batch);
     }
 
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(source.data(), source.size()).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(target.data(), target.size()).ok());
+}
+
+TEST(ProxyManager, ParentBatchWaitsForDeferredStagingWrites) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto fake = std::make_shared<DeferredCleanupProbeTransport>();
+    std::string segment = engine.getSegmentName();
+    ASSERT_TRUE(fake->install(segment, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake);
+    std::vector<uint8_t> source(128, 0x71);
+    std::vector<uint8_t> target(128, 0);
+    ASSERT_TRUE(engine.registerLocalMemory(source.data(), source.size()).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(target.data(), target.size()).ok());
+    auto parent = engine.allocateBatch(0);
+    {
+        ProxyManager manager(&engine, 64, 2);
+        TaskInfo task;
+        task.staging = true;
+        task.request.opcode = Request::WRITE;
+        task.request.source = source.data();
+        task.request.target_id = LOCAL_SEGMENT_ID;
+        task.request.target_offset = reinterpret_cast<uint64_t>(target.data());
+        task.request.length = source.size();
+        ASSERT_TRUE(
+            manager.submit(&task, parent, {"", kWildcardLocation, ""}).ok());
+        ASSERT_EQ(waitForStagingTerminal(manager, task).s, FAILED);
+        bool drained = true;
+        ASSERT_TRUE(engine.getBatchDrainStatus(parent, drained).ok());
+        EXPECT_FALSE(drained);
+        fake->stay_pending.store(false, std::memory_order_release);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        do {
+            ASSERT_TRUE(engine.getBatchDrainStatus(parent, drained).ok());
+            if (drained) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } while (std::chrono::steady_clock::now() < deadline);
+        // Recovery must progress without another application staging request.
+        EXPECT_TRUE(drained);
+    }
+    EXPECT_TRUE(engine.freeBatch(parent).ok());
     EXPECT_TRUE(
         engine.unregisterLocalMemory(source.data(), source.size()).ok());
     EXPECT_TRUE(

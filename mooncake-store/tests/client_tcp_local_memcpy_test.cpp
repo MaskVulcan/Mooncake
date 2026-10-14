@@ -1,13 +1,20 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "allocator.h"
@@ -16,6 +23,8 @@
 #include "types.h"
 #include "common/client_buffer_allocation.h"
 #include "common/network.h"
+#include "storage/distributed/distributed_storage_backend.h"
+#include "storage/distributed/posix_fs_adapter.h"
 
 namespace mooncake {
 namespace testing {
@@ -90,6 +99,56 @@ class StrategyCaptureSink : public google::LogSink {
     }
 
     std::string captured_strategy_;
+};
+
+// Gate the synchronous caller after a real validation/submission boundary.
+// This avoids relying on object size or transport speed to expire a deadline.
+class BatchDeadlineGateSink : public google::LogSink {
+   public:
+    explicit BatchDeadlineGateSink(std::string gate_message)
+        : gate_message_(std::move(gate_message)) {
+        google::AddLogSink(this);
+    }
+
+    ~BatchDeadlineGateSink() override { google::RemoveLogSink(this); }
+
+    void send(google::LogSeverity, const char*, const char*, int,
+              const struct ::tm*, const char* message,
+              size_t message_len) override {
+        const std::string_view value(message, message_len);
+        if (value.find("Submitted transfer for key ") !=
+            std::string_view::npos) {
+            submitted_.fetch_add(1);
+        }
+        if (value.find(gate_message_) != std::string_view::npos &&
+            !gated_.exchange(true)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        }
+    }
+
+    bool gated() const { return gated_.load(); }
+    size_t submitted() const { return submitted_.load(); }
+
+   private:
+    const std::string gate_message_;
+    std::atomic<bool> gated_{false};
+    std::atomic<size_t> submitted_{0};
+};
+
+class SlowFirstPosixReadAdapter : public PosixFsAdapter {
+   public:
+    tl::expected<size_t, ErrorCode> ReadAt(int fd, iovec* iov, int iovcnt,
+                                           int64_t offset) override {
+        if (read_calls_.fetch_add(1) == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        }
+        return PosixFsAdapter::ReadAt(fd, iov, iovcnt, offset);
+    }
+
+    size_t read_calls() const { return read_calls_.load(); }
+
+   private:
+    std::atomic<size_t> read_calls_{0};
 };
 
 struct ClientRuntime {
@@ -169,8 +228,20 @@ class TcpLocalMemcpyAutoEnableTest : public ::testing::Test {
         unsetenv("MC_STORE_MEMCPY");
 
         InProcMasterConfig config;
-        config.http_metadata_port = getFreeTcpPort();
-        ASSERT_TRUE(master_.Start(config));
+        // The tests never query admin metrics; bind that listener atomically
+        // to an ephemeral port. Retry only setup if another listener claimed
+        // a probed RPC/metadata port, never the read or its assertions.
+        config.http_metrics_port = 0;
+        bool started = false;
+        for (size_t attempt = 0; attempt < 3; ++attempt) {
+            config.http_metadata_port = getFreeTcpPort();
+            if (master_.Start(config)) {
+                started = true;
+                break;
+            }
+            master_.Stop();
+        }
+        ASSERT_TRUE(started);
         master_address_ = master_.master_address();
         metadata_url_ = master_.metadata_url();
     }
@@ -325,6 +396,163 @@ TEST_F(TcpLocalMemcpyAutoEnableTest, P2PLocalReplicaUsesLocalMemcpy) {
     EXPECT_EQ(sink.strategy(), "LOCAL_MEMCPY");
 }
 
+TEST_F(TcpLocalMemcpyAutoEnableTest,
+       BatchDeadlineDuringValidationPreventsNewTransfers) {
+    runtime_ = CreateRuntime("localhost", "P2PHANDSHAKE");
+    ASSERT_NE(runtime_.client, nullptr);
+    auto prepared = PrepareLocalObject("batch-deadline-source", "deadline");
+    const std::vector<std::string> keys{"batch-deadline-missing",
+                                        "batch-deadline-destination"};
+    const std::vector<QueryResult> queries{prepared.query_result,
+                                           prepared.query_result};
+    for (bool prefer_same_node : {false, true}) {
+        SCOPED_TRACE(prefer_same_node);
+        std::vector<char> destination(prepared.payload.size(), '\0');
+        std::unordered_map<std::string, std::vector<Slice>> slices{
+            {keys[1], {{destination.data(), destination.size()}}}};
+        BatchDeadlineGateSink gate("Slices not found for key: " + keys[0]);
+        const auto results = runtime_.client->BatchGet(keys, queries, slices,
+                                                       prefer_same_node, 10);
+        ASSERT_TRUE(gate.gated());
+        ASSERT_EQ(results.size(), keys.size());
+        ASSERT_FALSE(results[0].has_value());
+        EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_FALSE(results[1].has_value());
+        if (!results[1].has_value()) {
+            EXPECT_EQ(results[1].error(), ErrorCode::TRANSFER_FAIL);
+        }
+        EXPECT_EQ(gate.submitted(), 0);
+        EXPECT_EQ(destination, std::vector<char>(destination.size(), '\0'));
+    }
+}
+
+TEST_F(TcpLocalMemcpyAutoEnableTest,
+       BatchDeadlineAfterSubmissionDoesNotAcceptLateSuccessOrSubmitNextKey) {
+    runtime_ = CreateRuntime("localhost", "P2PHANDSHAKE");
+    ASSERT_NE(runtime_.client, nullptr);
+    auto prepared =
+        PrepareLocalObject("batch-submission-source", "submitted deadline");
+    const std::vector<std::string> keys{"batch-deadline-first",
+                                        "batch-deadline-second"};
+    const std::vector<QueryResult> queries{prepared.query_result,
+                                           prepared.query_result};
+    std::vector<char> first(prepared.payload.size(), '\0');
+    std::vector<char> second(prepared.payload.size(), '\0');
+    std::unordered_map<std::string, std::vector<Slice>> slices{
+        {keys[0], {{first.data(), first.size()}}},
+        {keys[1], {{second.data(), second.size()}}}};
+    BatchDeadlineGateSink gate("Submitted transfer for key " + keys[0]);
+    const auto results =
+        runtime_.client->BatchGet(keys, queries, slices, false, 10);
+    ASSERT_TRUE(gate.gated());
+    ASSERT_EQ(results.size(), keys.size());
+    for (const auto& result : results) {
+        EXPECT_FALSE(result.has_value());
+        if (!result.has_value()) {
+            EXPECT_EQ(result.error(), ErrorCode::TRANSFER_FAIL);
+        }
+    }
+    EXPECT_EQ(gate.submitted(), 1);
+    EXPECT_EQ(second, std::vector<char>(second.size(), '\0'));
+    // The accepted operation has drained; the caller may immediately reuse
+    // this destination even though the logical request failed.
+    std::fill(first.begin(), first.end(), 'R');
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(first, std::vector<char>(first.size(), 'R'));
+}
+
+TEST_F(TcpLocalMemcpyAutoEnableTest,
+       BatchDfsDeadlineStopsBeforeNextSynchronousRead) {
+    runtime_ = CreateRuntime("localhost", "P2PHANDSHAKE");
+    ASSERT_NE(runtime_.client, nullptr);
+    const std::string payload = "synchronous file read";
+    const auto root =
+        std::filesystem::absolute("data/client_batch_deadline_dfs");
+    std::filesystem::create_directories(root);
+    const auto file_path = root / "dfs_shard_00.data";
+    {
+        std::ofstream file(file_path, std::ios::binary | std::ios::trunc);
+        file.write(payload.data(), payload.size());
+        file.write(payload.data(), payload.size());
+        ASSERT_TRUE(file.good());
+    }
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    DistributedStorageConfig distributed_config;
+    distributed_config.fsdir = root.string();
+    distributed_config.fs_adapter_type = "posix";
+    distributed_config.shard_count = 1;
+    distributed_config.shard_capacity = 2 * payload.size();
+    distributed_config.alignment = 1;
+    auto adapter = std::make_unique<SlowFirstPosixReadAdapter>();
+    auto* read_adapter = adapter.get();
+    auto backend = std::make_shared<DistributedStorageBackend>(
+        file_config, distributed_config, std::move(adapter));
+    ASSERT_TRUE(backend->Init().has_value());
+    runtime_.client->SetDfsStorageBackend(backend);
+    const std::vector<std::string> keys{"batch-dfs-deadline-first",
+                                        "batch-dfs-deadline-second"};
+    std::vector<QueryResult> queries;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        Replica::Descriptor replica;
+        replica.status = ReplicaStatus::COMPLETE;
+        replica.descriptor_variant =
+            DistributedFSDescriptor{file_path.string(), i * payload.size(),
+                                    payload.size(), payload.size(), 0};
+        queries.emplace_back(
+            std::vector<Replica::Descriptor>{replica},
+            std::chrono::steady_clock::now() + std::chrono::minutes(1));
+    }
+    std::vector<char> first(payload.size(), '\0');
+    std::vector<char> second(payload.size(), '\0');
+    std::unordered_map<std::string, std::vector<Slice>> slices{
+        {keys[0], {{first.data(), first.size()}}},
+        {keys[1], {{second.data(), second.size()}}}};
+    const auto results =
+        runtime_.client->BatchGet(keys, queries, slices, false, 10);
+    ASSERT_EQ(results.size(), keys.size());
+    for (const auto& result : results) {
+        EXPECT_FALSE(result.has_value());
+        if (!result.has_value()) {
+            EXPECT_EQ(result.error(), ErrorCode::TRANSFER_FAIL);
+        }
+    }
+    EXPECT_EQ(read_adapter->read_calls(), 1);
+    EXPECT_EQ(second, std::vector<char>(second.size(), '\0'));
+    std::fill(first.begin(), first.end(), 'R');
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(first, std::vector<char>(first.size(), 'R'));
+    runtime_.client->SetDfsStorageBackend(nullptr);
+    backend.reset();
+    std::filesystem::remove_all(root);
+}
+
+TEST_F(TcpLocalMemcpyAutoEnableTest,
+       OffloadDeadlineIncludesSubmissionAndDrainsBeforeDestinationReuse) {
+    runtime_ = CreateRuntime("localhost", "P2PHANDSHAKE");
+    ASSERT_NE(runtime_.client, nullptr);
+    auto prepared =
+        PrepareLocalObject("batch-offload-deadline", "offload deadline");
+    const auto pointer = prepared.replica.get_memory_descriptor()
+                             .buffer_descriptor.buffer_address_;
+    std::vector<char> destination(prepared.payload.size(), '\0');
+    std::unordered_map<std::string, std::vector<Slice>> slices{
+        {prepared.key, {{destination.data(), destination.size()}}}};
+    BatchDeadlineGateSink gate("Using transfer strategy: LOCAL_MEMCPY");
+    const auto result = runtime_.client->BatchGetOffloadObject(
+        runtime_.client->GetTransportEndpoint(), {prepared.key}, {pointer},
+        slices, OffloadBufferAccess::kLocalAddress,
+        TransferIntent::kForegroundGet, 10);
+    EXPECT_TRUE(gate.gated());
+    EXPECT_FALSE(result.has_value());
+    if (!result.has_value()) {
+        EXPECT_EQ(result.error(), ErrorCode::TRANSFER_FAIL);
+    }
+    std::fill(destination.begin(), destination.end(), 'R');
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(destination, std::vector<char>(destination.size(), 'R'));
+}
+
 TEST_F(TcpLocalMemcpyAutoEnableTest, MetadataLocalReplicaUsesLocalMemcpy) {
     runtime_ = CreateRuntime("localhost", metadata_url_);
     ASSERT_TRUE(runtime_.client != nullptr);
@@ -432,6 +660,46 @@ TEST_F(TcpLocalMemcpyAutoEnableTest,
 class HotCacheRedirectStrategyTest
     : public TcpLocalMemcpyAutoEnableTest,
       public ::testing::WithParamInterface<HandshakeMode> {};
+
+TEST_F(TcpLocalMemcpyAutoEnableTest,
+       BatchCacheDescriptorMismatchReleasesBorrowedSource) {
+    EnvGuard cache_size_guard("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "33554432", 1);
+    runtime_ = CreateRuntime("localhost", "P2PHANDSHAKE");
+    ASSERT_NE(runtime_.client, nullptr);
+    ASSERT_TRUE(runtime_.client->IsHotCacheEnabled());
+    const auto cache = runtime_.client->GetHotCache();
+    const std::string key = "batch-cache-size-mismatch";
+    const std::string payload = "cached source";
+    ASSERT_TRUE(PutHotKeyHelper(
+        *cache, key, Slice{const_cast<char*>(payload.data()), payload.size()}));
+    Replica::Descriptor replica;
+    replica.status = ReplicaStatus::COMPLETE;
+    MemoryDescriptor descriptor;
+    descriptor.buffer_descriptor.transport_endpoint_ =
+        runtime_.client->GetTransportEndpoint();
+    descriptor.buffer_descriptor.buffer_address_ = 0;
+    descriptor.buffer_descriptor.size_ = payload.size() + 1;
+    replica.descriptor_variant = descriptor;
+    const std::vector<QueryResult> queries{QueryResult(
+        {replica}, std::chrono::steady_clock::now() + std::chrono::minutes(1))};
+    std::vector<char> destination(payload.size(), '\0');
+    std::unordered_map<std::string, std::vector<Slice>> slices{
+        {key, {{destination.data(), destination.size()}}}};
+    for (bool prefer_same_node : {false, true}) {
+        SCOPED_TRACE(prefer_same_node);
+        const auto results =
+            runtime_.client->BatchGet({key}, queries, slices, prefer_same_node);
+        ASSERT_EQ(results.size(), 1);
+        ASSERT_FALSE(results[0].has_value());
+        auto* block = cache->GetHotKey(key);
+        ASSERT_NE(block, nullptr);
+        // Only this inspection owns a reference. A rejected redirection must
+        // not keep the cache source borrowed after BatchGet returns.
+        EXPECT_EQ(block->ref_count.load(), 1);
+        cache->ReleaseHotKey(key);
+    }
+}
 
 TEST_P(HotCacheRedirectStrategyTest, CacheHitUsesLocalMemcpy) {
     EnvGuard cache_size_guard("MC_STORE_LOCAL_HOT_CACHE_SIZE");

@@ -4,8 +4,34 @@
 #include <cstddef>
 #include <random>
 #include <stdexcept>
+#include <span>
+#include <algorithm>
+#include <cerrno>
+#if defined(__linux__) || defined(__APPLE__)
+#include <sys/random.h>
+#endif
 
 namespace mooncake {
+
+// OS cryptographic entropy; false never falls back to the shared PRNG.
+inline bool secureRandomBytes(std::span<std::byte> bytes) noexcept {
+    size_t offset = 0;
+    while (offset < bytes.size()) {
+#if defined(__linux__) || defined(__APPLE__)
+        // getentropy limits each request to 256 bytes. It either fills the
+        // entire request or fails; it never exposes a short successful read.
+        const auto count = std::min(size_t{256}, bytes.size() - offset);
+        if (::getentropy(bytes.data() + offset, count) == 0) {
+            offset += count;
+            continue;
+        }
+        if (errno == EINTR) continue;
+#endif
+        std::fill(bytes.begin(), bytes.end(), std::byte{0});
+        return false;
+    }
+    return true;
+}
 
 using RandomEngine = std::mt19937_64;
 

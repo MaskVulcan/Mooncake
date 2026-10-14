@@ -16,6 +16,7 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #ifdef MOONCAKE_TEST_CUDA_H2D
 #include <cuda_runtime_api.h>
@@ -26,9 +27,16 @@
 #endif
 
 #include "config.h"
+#include "device/accelerator_registry.h"
 #include "real_client.h"
 #include "tenant_id.h"
+#include "ssd_direct_runtime.h"
+#include "ssd_control_rpc.h"
+#include "ssd_transfer_target.h"
+#include <json/json.h>
+#include <future>
 #include "test_server_helpers.h"
+#include "tenant/quota_policy_store.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
@@ -91,6 +99,51 @@ TEST(TransportRegistrationLimitTest, ClassifiesProtocols) {
     EXPECT_EQ(GetTransportRegistrationLimit("efa"), kMaxMrSize);
     EXPECT_EQ(GetTransportRegistrationLimit("cxi"), kMaxMrSize);
     EXPECT_TRUE(GetTransportRegistrationLimit("ub").has_value());
+}
+
+// Host-backed test device: only an explicitly selected destination range is
+// classified as device memory. Registration happens before any client I/O.
+class StreamingTestDevice final : public device::AcceleratorDevice {
+   public:
+    device::AcceleratorVendor Vendor() const override {
+        return device::AcceleratorVendor::kSunrise;
+    }
+    bool Available(bool = false) const override { return true; }
+    device::PointerInfo QueryPointer(const void* ptr) const override {
+        const auto address = reinterpret_cast<uintptr_t>(ptr);
+        const auto start = begin.load();
+        return {start && address >= start && address - start < bytes.load()
+                    ? device::MemoryKind::kDevice
+                    : device::MemoryKind::kHost,
+                0};
+    }
+    int32_t CurrentDeviceId() const override { return 0; }
+    void SetContext(int32_t) const override {}
+    bool Copy(void* dst, const void* src, size_t size,
+              device::CopyDirection) const override {
+        ++copy_calls;
+        if (const auto delay = copy_delay_ms.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+        std::memcpy(dst, src, size);
+        return true;
+    }
+    PinnedHostBuffer AllocatePinnedHost(size_t) const override { return {}; }
+    std::atomic<uintptr_t> begin{0};
+    std::atomic<size_t> bytes{0};
+    std::atomic<size_t> copy_delay_ms{0};
+    mutable std::atomic<size_t> copy_calls{0};
+};
+
+StreamingTestDevice* RegisterStreamingTestDevice() {
+    static StreamingTestDevice device;
+    static bool registered = [] {
+        if (device::GetAcceleratorRegistry().GetDevice(
+                device::AcceleratorVendor::kSunrise))
+            return false;
+        static device::AcceleratorDeviceRegistrar registrar(device);
+        return true;
+    }();
+    return registered ? &device : nullptr;
 }
 
 class RealClientTest : public ::testing::Test {
@@ -175,7 +228,192 @@ class RealClientTest : public ::testing::Test {
         close(fd);
         return path;
     }
+    std::vector<tl::expected<QueryResult, ErrorCode>> QueryOnlyLocalDisk(
+        const std::vector<std::string>& keys) {
+        auto queries = py_client_->batch_query(keys);
+        std::vector<tl::expected<QueryResult, ErrorCode>> filtered;
+        for (const auto& query : queries) {
+            if (!query) {
+                filtered.push_back(tl::unexpected(query.error()));
+                continue;
+            }
+            std::vector<Replica::Descriptor> replicas;
+            for (const auto& replica : query->replicas)
+                if (replica.is_local_disk_replica())
+                    replicas.push_back(replica);
+            filtered.emplace_back(QueryResult(std::move(replicas),
+                                              query->lease_timeout,
+                                              query->object_checksum));
+        }
+        return filtered;
+    }
+    auto DirectRead(RealClient& client, const std::string& endpoint,
+                    void* dst) {
+        return client.ssd_direct_->Read(endpoint,
+                                        {{"pending", 32, 0, {{dst, 32}}}},
+                                        std::chrono::milliseconds(100));
+    }
+    std::shared_ptr<TransferEngine> Engine(RealClient& client) {
+        return client.client_->GetTransferEngine();
+    }
+    void RunFixedL2DirectRestore(bool automatic_bootstrap);
 };
+
+TEST_F(RealClientTest, LocalStreamingSsdRestoreLargerThanArenaAndRange) {
+    auto* test_device = RegisterStreamingTestDevice();
+    ScopedEnvVar streaming("MOONCAKE_OFFLOAD_LOCAL_STREAMING_READ", "true");
+    ScopedEnvVar arena("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "524288");
+    ScopedEnvVar slot_bytes("MOONCAKE_OFFLOAD_STREAM_SLOT_BYTES", "65536");
+    ScopedEnvVar slots("MOONCAKE_OFFLOAD_STREAM_SLOTS", "1");
+    ScopedEnvVar source_budget("MOONCAKE_OFFLOAD_STREAM_MAX_OUTSTANDING", "2");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                         "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    char path[] = "/tmp/mooncake_ssd_streaming_XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    ssd_path_ = path;
+    TenantQuotaPolicySnapshot policy;
+    policy.tenant_quotas.emplace("stream-tenant", 64 * 1024 * 1024);
+    ASSERT_TRUE(YamlTenantQuotaPolicyStore(ssd_path_ + "/tenant-policy.yaml")
+                    .Save(policy));
+    // Snapshot reads cannot renew their lease. Allow native ring registration
+    // and I/O under the low-priority test budget; TTL is in milliseconds.
+    ASSERT_TRUE(master_.Start(
+        InProcMasterConfigBuilder()
+            .set_enable_offload(true)
+            .set_default_kv_lease_ttl(1000)
+            .set_enable_multi_tenants(true)
+            .set_tenant_quota_connector_uri(ssd_path_ + "/tenant-policy.yaml")
+            .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024,
+                                     FLAGS_protocol, FLAGS_device_name,
+                                     master_address_, nullptr, "", true,
+                                     ssd_path_, "stream-tenant"),
+              0);
+    std::vector<char> source(6 * 1024 * 1024);
+    for (size_t i = 0; i < source.size(); ++i) source[i] = char(i % 251);
+    const std::string key = "local-streaming-key";
+    ASSERT_EQ(py_client_->put(key, source), 0);
+    bool disk_ready = false;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!disk_ready && std::chrono::steady_clock::now() < deadline) {
+        for (const auto& replica : py_client_->get_replica_desc(key))
+            disk_ready |= replica.is_local_disk_replica();
+        if (!disk_ready)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    ASSERT_TRUE(disk_ready);
+    // Force the real LOCAL_DISK replica from the master query. The sync
+    // baseline's legacy BatchReplicaClear RPC does not carry tenant IDs.
+    auto disk_queries = QueryOnlyLocalDisk({key});
+    ASSERT_EQ(disk_queries.size(), 1);
+    ASSERT_TRUE(disk_queries[0]);
+    ASSERT_EQ(disk_queries[0]->replicas.size(), 1);
+    std::vector<char> destination(source.size());
+    ASSERT_EQ(
+        py_client_->register_buffer(destination.data(), destination.size()), 0);
+    const auto reads_before = py_client_->get_offload_rpc_read_count();
+    const auto reader = [&](const std::string& endpoint,
+                            RealClient::LocalDiskOffloadObjects& objects) {
+        return py_client_->batch_get_into_offload_object_internal(endpoint,
+                                                                  objects);
+    };
+    auto restored = py_client_->batch_get_into_internal(
+        {key}, {destination.data()}, {destination.size()}, disk_queries,
+        reader);
+    ASSERT_EQ(restored.size(), 1);
+    ASSERT_TRUE(restored[0]);
+    EXPECT_EQ(restored[0].value(), int64_t(source.size()));
+    EXPECT_EQ(destination, source);
+    EXPECT_EQ(py_client_->get_offload_rpc_read_count(), reads_before + 1);
+    constexpr size_t offset = 12345, length = 150000;
+    PyClient::QueryResultCache snapshot;
+    snapshot.emplace(key, QueryOnlyLocalDisk({key})[0]);
+    auto range = py_client_->get_into_ranges_from_snapshot(
+        {destination.data()}, {{key}}, {{{0}}}, {{{offset}}}, {{{length}}},
+        snapshot);
+    ASSERT_EQ(range.size(), 1);
+    ASSERT_EQ(range[0].size(), 1);
+    ASSERT_EQ(range[0][0].size(), 1);
+    EXPECT_EQ(range[0][0][0], int64_t(length));
+    EXPECT_EQ(py_client_->get_offload_rpc_read_count(), reads_before + 2);
+    EXPECT_TRUE(std::equal(destination.begin(), destination.begin() + length,
+                           source.begin() + offset));
+    if (test_device) {
+        struct ResetRange {
+            StreamingTestDevice& device;
+            ~ResetRange() {
+                device.begin.store(0);
+                device.bytes.store(0);
+            }
+        } reset{*test_device};
+        test_device->bytes.store(destination.size());
+        test_device->begin.store(
+            reinterpret_cast<uintptr_t>(destination.data()));
+        PyClient::QueryResultCache device_snapshot;
+        device_snapshot.emplace(key, QueryOnlyLocalDisk({key})[0]);
+        auto device_range = py_client_->get_into_ranges_from_snapshot(
+            {destination.data()}, {{key}}, {{{0}}}, {{{offset}}}, {{{length}}},
+            device_snapshot);
+        ASSERT_EQ(device_range.size(), 1);
+        ASSERT_EQ(device_range[0].size(), 1);
+        ASSERT_EQ(device_range[0][0].size(), 1);
+        EXPECT_EQ(device_range[0][0][0], int64_t(length));
+        EXPECT_TRUE(std::equal(destination.begin(),
+                               destination.begin() + length,
+                               source.begin() + offset));
+    }
+    EXPECT_EQ(py_client_->unregister_buffer(destination.data()), 0);
+
+    // Three sources exceed this test's streaming source budget (two), but
+    // their whole values fit the legacy arena. Exercise admission fallback.
+    std::vector<std::string> small_keys{"fallback-a", "fallback-b",
+                                        "fallback-c"};
+    std::vector<std::vector<char>> small_sources, small_destinations;
+    for (size_t i = 0; i < small_keys.size(); ++i) {
+        small_sources.emplace_back(16384, char('a' + i));
+        small_destinations.emplace_back(16384, 0);
+        ASSERT_EQ(py_client_->put(small_keys[i], small_sources[i]), 0);
+    }
+    bool small_ready = false;
+    const auto small_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!small_ready && std::chrono::steady_clock::now() < small_deadline) {
+        small_ready = true;
+        for (const auto& small_key : small_keys) {
+            bool ready = false;
+            for (const auto& replica : py_client_->get_replica_desc(small_key))
+                ready |= replica.is_local_disk_replica();
+            small_ready &= ready;
+        }
+        if (!small_ready)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    ASSERT_TRUE(small_ready);
+    std::vector<void*> small_pointers;
+    for (auto& small : small_destinations) {
+        ASSERT_EQ(py_client_->register_buffer(small.data(), small.size()), 0);
+        small_pointers.push_back(small.data());
+    }
+    const auto fallback_reads_before = py_client_->get_offload_rpc_read_count();
+    auto fallback = py_client_->batch_get_into_internal(
+        small_keys, small_pointers, {16384, 16384, 16384},
+        QueryOnlyLocalDisk(small_keys), reader);
+    ASSERT_EQ(fallback.size(), 3);
+    for (const auto& result : fallback) {
+        ASSERT_TRUE(result);
+        EXPECT_EQ(result.value(), 16384);
+    }
+    EXPECT_EQ(small_destinations, small_sources);
+    EXPECT_EQ(py_client_->get_offload_rpc_read_count(),
+              fallback_reads_before + 1);
+    for (auto& small : small_destinations)
+        EXPECT_EQ(py_client_->unregister_buffer(small.data()), 0);
+}
 
 TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
     StartMasterAndSetupClient();
@@ -252,6 +490,94 @@ TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
         ASSERT_FALSE(results[0].has_value());
         EXPECT_EQ(results[0].error(), ErrorCode::RPC_FAIL);
     }
+}
+
+TEST_F(RealClientTest, BatchGetIntoSharesDeadlineAcrossSsdOwners) {
+    ScopedEnvVar concurrency("MOONCAKE_OFFLOAD_READ_CONCURRENCY", "1");
+    StartMasterAndSetupClient();
+    std::vector<tl::expected<QueryResult, ErrorCode>> queries;
+    for (const auto* endpoint : {"owner-a", "owner-b"}) {
+        Replica::Descriptor replica;
+        replica.descriptor_variant =
+            LocalDiskDescriptor{generate_uuid(), 16, endpoint};
+        replica.status = ReplicaStatus::COMPLETE;
+        queries.emplace_back(QueryResult(
+            {replica},
+            std::chrono::steady_clock::now() + std::chrono::minutes(1)));
+    }
+    std::array<char, 16> first{}, second{};
+    size_t calls = 0;
+    auto slow_reader = [&](const std::string&,
+                           RealClient::LocalDiskOffloadObjects& objects)
+        -> tl::expected<void, ErrorCode> {
+        ++calls;
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        for (auto& [key, slices] : objects)
+            for (const auto& slice : slices)
+                std::memset(slice.ptr, 'S', slice.size);
+        return {};
+    };
+    auto results = py_client_->batch_get_into_internal(
+        {"first", "second"}, {first.data(), second.data()}, {16, 16}, queries,
+        slow_reader, 10);
+    ASSERT_EQ(results.size(), 2u);
+    EXPECT_EQ(calls, 1u);  // Do not start another owner after budget expiry.
+    for (const auto& result : results) {
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::TRANSFER_FAIL);
+    }
+    const auto was_written = [](const auto& bytes) {
+        return std::all_of(bytes.begin(), bytes.end(),
+                           [](char c) { return c == 'S'; });
+    };
+    EXPECT_NE(was_written(first), was_written(second));
+}
+
+TEST_F(RealClientTest, BatchGetDeadlineIncludesDuplicateDeviceCopy) {
+    auto* device = RegisterStreamingTestDevice();
+    if (!device) GTEST_SKIP() << "Native accelerator owns the test vendor";
+    StartMasterAndSetupClient();
+    const std::string key = "duplicate-copy-deadline";
+    ASSERT_EQ(py_client_->put(key, std::vector<char>(16, 'S')), 0);
+    std::array<char, 16> primary{}, duplicate{};
+    ASSERT_EQ(py_client_->register_buffer(primary.data(), primary.size()), 0);
+    ASSERT_EQ(py_client_->register_buffer(duplicate.data(), duplicate.size()),
+              0);
+    struct Reset {
+        StreamingTestDevice& device;
+        ~Reset() {
+            device.begin = 0;
+            device.bytes = 0;
+            device.copy_delay_ms = 0;
+        }
+    } reset{*device};
+    device->begin = uintptr_t(duplicate.data());
+    device->bytes = duplicate.size();
+    device->copy_delay_ms = 150;
+    for (const bool nested : {false, true}) {
+        SCOPED_TRACE(nested ? "nested" : "flat");
+        primary.fill('?');
+        duplicate.fill('?');
+        const auto copies_before = device->copy_calls.load();
+        std::vector<int64_t> results;
+        if (nested) {
+            auto values = py_client_->batch_get_into_multi_buffers(
+                {key, key}, {{primary.data()}, {duplicate.data()}},
+                {{16}, {16}}, false, 100);
+            results.assign(values.begin(), values.end());
+        } else {
+            results = py_client_->batch_get_into(
+                {key, key}, {primary.data(), duplicate.data()}, {16, 16}, 100);
+        }
+        EXPECT_EQ(device->copy_calls.load(), copies_before + 1);
+        EXPECT_EQ(results,
+                  (std::vector<int64_t>{toInt(ErrorCode::TRANSFER_FAIL),
+                                        toInt(ErrorCode::TRANSFER_FAIL)}));
+        EXPECT_TRUE(std::all_of(duplicate.begin(), duplicate.end(),
+                                [](char value) { return value == 'S'; }));
+    }
+    EXPECT_EQ(py_client_->unregister_buffer(primary.data()), 0);
+    EXPECT_EQ(py_client_->unregister_buffer(duplicate.data()), 0);
 }
 
 TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
@@ -3091,6 +3417,154 @@ TEST_F(RealClientTest, DoubleTearDownIsIdempotent) {
         << "Second teardown should also succeed (idempotent)";
 }
 
+TEST_F(RealClientTest, TearDownSsdStopsRpcAndBackgroundStorageBeforeReturning) {
+    ScopedEnvVar arena("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "1048576");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar gc("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS", "1");
+    ScopedEnvVar backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                         "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    char path[] = "/tmp/mooncake_ssd_close_XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    ssd_path_ = path;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(py_client_->setup_real(
+                  "localhost:17813", "P2PHANDSHAKE", 16 * 1024 * 1024,
+                  16 * 1024 * 1024, FLAGS_protocol, FLAGS_device_name,
+                  master_address_, nullptr, "", true, ssd_path_),
+              0);
+    const std::string key = "ssd-close-key";
+    std::vector<char> source(4096, 'c');
+    ASSERT_EQ(py_client_->put(key, source), 0);
+    std::string endpoint;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (endpoint.empty() && std::chrono::steady_clock::now() < deadline) {
+        for (const auto& replica : py_client_->get_replica_desc(key))
+            if (replica.is_local_disk_replica() &&
+                replica.status == ReplicaStatus::COMPLETE)
+                endpoint =
+                    replica.get_local_disk_descriptor().transport_endpoint;
+        if (endpoint.empty())
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_FALSE(endpoint.empty());
+    ClientRequester requester;
+    const auto storage_key = TenantId::Default().MakeScopedKey(key);
+    auto before =
+        requester.batch_get_offload_object(endpoint, {storage_key}, {4096});
+    ASSERT_TRUE(before);
+    requester.release_offload_buffer(endpoint, before->batch_id);
+
+    std::weak_ptr<FileStorage> storage = py_client_->file_storage_;
+    std::weak_ptr<Client> client = py_client_->client_;
+    ASSERT_EQ(py_client_->tearDownAll(), 0);
+    // Keep the wrapper and master alive: explicit close must complete its own
+    // shutdown, independently of later wrapper GC or master shutdown.
+    EXPECT_TRUE(storage.expired());
+    EXPECT_TRUE(client.expired());
+    EXPECT_EQ(py_client_->health_check(), HC_NOT_INITIALIZED);
+    auto after =
+        requester.batch_get_offload_object(endpoint, {storage_key}, {4096});
+    EXPECT_FALSE(after);
+    EXPECT_EQ(py_client_->tearDownAll(), 0);
+}
+
+TEST_F(RealClientTest, TearDownSsdRetainsExportedArenaWithSharedEngine) {
+    if (FLAGS_protocol != "tcp")
+        GTEST_SKIP() << "Classic TCP shared engine fixture";
+    ScopedEnvVar arena("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "1048576");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar gc("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS", "1");
+    ScopedEnvVar backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                         "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    char path[] = "/tmp/mooncake_ssd_close_XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    ssd_path_ = path;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    auto shared_engine = std::make_shared<TransferEngine>(false);
+    if (shared_engine->isUsingTent())
+        GTEST_SKIP() << "Classic TCP shared engine fixture";
+    ASSERT_EQ(
+        shared_engine->init("P2PHANDSHAKE", "127.0.0.1:0", "127.0.0.1", 0), 0);
+    ASSERT_NE(shared_engine->installTransport("tcp", nullptr), nullptr);
+    ASSERT_EQ(py_client_->setup_real(
+                  "localhost:17813", "P2PHANDSHAKE", 16 * 1024 * 1024,
+                  16 * 1024 * 1024, FLAGS_protocol, FLAGS_device_name,
+                  master_address_, shared_engine, "", true, ssd_path_),
+              0);
+    const std::string key = "ssd-close-key";
+    std::vector<char> source(4096, 'c');
+    ASSERT_EQ(py_client_->put(key, source), 0);
+    std::string endpoint;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (endpoint.empty() && std::chrono::steady_clock::now() < deadline) {
+        for (const auto& replica : py_client_->get_replica_desc(key))
+            if (replica.is_local_disk_replica() &&
+                replica.status == ReplicaStatus::COMPLETE)
+                endpoint =
+                    replica.get_local_disk_descriptor().transport_endpoint;
+        if (endpoint.empty())
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_FALSE(endpoint.empty());
+    ClientRequester requester;
+    const auto storage_key = TenantId::Default().MakeScopedKey(key);
+    auto before =
+        requester.batch_get_offload_object(endpoint, {storage_key}, {4096});
+    ASSERT_TRUE(before);
+    // Deliberately do not Release: a descriptor already handed to a peer can
+    // still be used after this Store stops serving new SSD RPCs.
+
+    std::weak_ptr<FileStorage> storage = py_client_->file_storage_;
+    std::weak_ptr<Client> client = py_client_->client_;
+    ASSERT_EQ(py_client_->tearDownAll(), 0);
+    // Keep the wrapper and master alive: explicit close must complete its own
+    // shutdown, independently of later wrapper GC or master shutdown.
+    EXPECT_TRUE(storage.expired());
+    EXPECT_TRUE(client.expired());
+    EXPECT_EQ(py_client_->health_check(), HC_NOT_INITIALIZED);
+    auto after =
+        requester.batch_get_offload_object(endpoint, {storage_key}, {4096});
+    EXPECT_FALSE(after);
+    auto reader = std::make_shared<TransferEngine>(false);
+    ASSERT_EQ(reader->init("P2PHANDSHAKE", "127.0.0.1:0", "127.0.0.1", 0), 0);
+    ASSERT_NE(reader->installTransport("tcp", nullptr), nullptr);
+    std::vector<char> destination(source.size(), '?');
+    ASSERT_EQ(
+        reader->registerLocalMemory(destination.data(), destination.size(),
+                                    "cpu:0", false, false),
+        0);
+    const std::array<size_t, 1> offsets{0}, lengths{source.size()};
+    auto transfer = reader->submitScatter({{TransferRequest::READ,
+                                            before->transfer_engine_addr,
+                                            before->pointers[0],
+                                            source.size(),
+                                            destination.data(),
+                                            destination.size(),
+                                            offsets,
+                                            offsets,
+                                            lengths,
+                                            {}}});
+    ASSERT_TRUE(transfer.wait().ok());
+    EXPECT_EQ(destination, source);
+    ASSERT_EQ(reader->unregisterLocalMemory(destination.data(), false), 0);
+    // Destroying the externally owned backend is the physical lifetime
+    // boundary. No FileStorage/Client cycle is needed to keep its arena alive.
+    shared_engine.reset();
+    EXPECT_EQ(py_client_->tearDownAll(), 0);
+}
+
 // ===================== Empty Batch Operations =====================
 
 TEST_F(RealClientTest, EmptyBatchOperations) {
@@ -4216,3 +4690,330 @@ int main(int argc, char** argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, false);
     return RUN_ALL_TESTS();
 }
+
+namespace mooncake::testing {
+TEST_F(RealClientTest, FixedL2CloseUnregistersExternalPoolFromSharedEngine) {
+    ScopedEnvVar push("MOONCAKE_OFFLOAD_SSD_PUSH", "true");
+    StartMasterAndSetupClient();
+    if (py_client_->get_ssd_push_peer_info() == "{}")
+        GTEST_SKIP() << "Fixed L2 adapter requires classic TE";
+    auto engine = Engine(*py_client_);
+    std::array<char, 64> l2{};
+    ASSERT_EQ(py_client_->register_buffer(l2.data(), l2.size()), 0);
+    const auto registered = [&] {
+        auto desc = engine->getMetadata()->getSegmentDescByID(0);
+        return desc &&
+               std::any_of(desc->buffers.begin(), desc->buffers.end(),
+                           [&](const auto& mr) {
+                               return mr.addr ==
+                                      reinterpret_cast<uint64_t>(l2.data());
+                           });
+    };
+    ASSERT_TRUE(registered());
+    EXPECT_EQ(py_client_->tearDownAll(), 0);
+    EXPECT_FALSE(registered());
+    // The caller deliberately retains the TE after Store close.
+    engine->unregisterLocalMemory(l2.data(), true);
+}
+TEST_F(RealClientTest,
+       DirectBootstrapAndRecoveryRemainSafeDuringConcurrentClose) {
+    ScopedEnvVar push("MOONCAKE_OFFLOAD_SSD_PUSH", "true");
+    StartMasterAndSetupClient();
+    if (py_client_->get_ssd_push_peer_info() == "{}")
+        GTEST_SKIP() << "Fixed L2 adapter requires classic TE";
+    std::atomic<bool> stop{false};
+    std::atomic<size_t> calls{0};
+    std::barrier entered(9);
+    std::vector<std::thread> workers;
+    for (size_t i = 0; i < 8; ++i)
+        workers.emplace_back([&] {
+            entered.arrive_and_wait();
+            while (!stop) {
+                py_client_->get_ssd_push_peer_info();
+                py_client_->recover_ssd_push();
+                py_client_->configure_ssd_push_peers({});
+                ++calls;
+            }
+        });
+    entered.arrive_and_wait();
+    while (calls < 100) std::this_thread::yield();
+    EXPECT_EQ(py_client_->tearDownAll(), 0);
+    stop = true;
+    for (auto& worker : workers) worker.join();
+    EXPECT_EQ(py_client_->get_ssd_push_peer_info(), "{}");
+    EXPECT_EQ(py_client_->recover_ssd_push(), -1);
+}
+TEST_F(RealClientTest,
+       PendingDirectWriteProtectsFullAndOffsetMemoryReadsAndClose) {
+    using namespace ssd_offload;
+    ScopedEnvVar push("MOONCAKE_OFFLOAD_SSD_PUSH", "true");
+    StartMasterAndSetupClient();
+    if (py_client_->get_ssd_push_peer_info() == "{}")
+        GTEST_SKIP() << "Fixed L2 adapter requires classic TE";
+    auto requester = RealClient::create();
+    ASSERT_EQ(requester->setup_real("localhost:17814", "P2PHANDSHAKE", 0,
+                                    1024 * 1024, "tcp", "", master_address_),
+              0);
+    ASSERT_EQ(py_client_->put("memory", std::vector<char>(64, 'M')), 0);
+    std::array<char, 64> l2;
+    l2.fill('?');
+    ASSERT_EQ(requester->register_buffer(l2.data(), l2.size()), 0);
+    std::array<char, 16> idle{};
+    ASSERT_EQ(requester->register_buffer(idle.data(), idle.size()), 0);
+    const auto parse = [](const std::string& info) {
+        Json::Value value;
+        std::istringstream stream(info);
+        stream >> value;
+        return value;
+    };
+    const auto fixed = [](const Json::Value& value) {
+        return SsdFixedL2Peer{
+            {value["client_id_high"].asUInt64(),
+             value["client_id_low"].asUInt64(), value["boot_epoch"].asUInt64()},
+            value["tenant"].asString(),
+            value["transport_endpoint"].asString(),
+            {value["credential_high"].asUInt64(),
+             value["credential_low"].asUInt64()}};
+    };
+    auto owner_info = parse(py_client_->get_ssd_push_peer_info());
+    auto self = fixed(parse(requester->get_ssd_push_peer_info()));
+    std::promise<void> entered, resume;
+    auto resumed = resume.get_future().share();
+    auto owner_engine = Engine(*py_client_);
+    std::array<std::byte, 32> source;
+    source.fill(std::byte{'S'});
+    ASSERT_EQ(owner_engine->registerLocalMemory(source.data(), source.size()),
+              0);
+    struct Release {
+        std::promise<void>& signal;
+        bool released{false};
+        void Now() {
+            if (!released) {
+                released = true;
+                signal.set_value();
+            }
+        }
+        ~Release() { Now(); }
+    };
+    auto core = std::make_shared<SsdDirectReadOwner>(
+        fixed(owner_info).identity, std::vector<SsdFixedL2Peer>{self},
+        [engine = Engine(*py_client_)](auto views) {
+            return PrepareSsdTcpWriteTarget(engine, std::move(views)).target;
+        },
+        [&](const auto& request, auto target,
+            auto) -> std::optional<SsdReadResultV1> {
+            entered.set_value();
+            resumed.wait();
+            const auto chunk =
+                BuildReadPlan({32, 0, {{0, {{1, 1, 0, 32}}}}}, {32, 1, 2})
+                    .plan.chunks[0];
+            const auto error =
+                target->WriteAndDrain(chunk, {source.data(), source.size()});
+            return SsdReadResultV1{
+                1,
+                request.attempt,
+                target->DestinationsDrained(),
+                {{0,
+                  error == Error::kOk ? AttemptOutcome::kSucceeded
+                                      : AttemptOutcome::kFailed,
+                  error == Error::kOk ? uint64_t{32} : uint64_t{0},
+                  {}}},
+                request.requester};
+        });
+    SsdReadIntoRpcEndpoint endpoint(core);
+    SsdControlRpcServer server(2, 0, "127.0.0.1");
+    server.register_handler<&SsdReadIntoRpcEndpoint::Call>(&endpoint);
+    server.async_start();
+    Release release{
+        resume};  // Always unblock before server/endpoint destruction.
+    ASSERT_FALSE(server.get_errc());
+    owner_info["control_port"] = Json::UInt64(server.port());
+    owner_info["control_host"] = "127.0.0.1";
+    owner_info["can_read_ssd"] = true;
+    Json::StreamWriterBuilder writer;
+    ASSERT_EQ(requester->configure_ssd_push_peers(
+                  {Json::writeString(writer, owner_info)}),
+              0);
+    auto started = entered.get_future();
+    auto read = std::async(std::launch::async, [&] {
+        return DirectRead(*requester, owner_info["legacy_endpoint"].asString(),
+                          l2.data() + 32);
+    });
+    EXPECT_EQ(started.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    // The original 100ms RPC may end, but Store must keep this borrowed page
+    // until the gated real writer has stopped. FluentLLM frees pages after
+    // either a successful or failed native return.
+    EXPECT_EQ(read.wait_for(std::chrono::milliseconds(200)),
+              std::future_status::timeout);
+    EXPECT_LT(requester->get_into("memory", l2.data(), 64), 0);
+    EXPECT_TRUE(
+        std::all_of(l2.begin(), l2.end(), [](char b) { return b == '?'; }));
+    l2.fill('?');
+    auto ranges = requester->get_into_ranges({l2.data()}, {{"memory"}},
+                                             {{{32}}}, {{{0}}}, {{{32}}});
+    EXPECT_LT(ranges[0][0][0], 0);
+    EXPECT_TRUE(
+        std::all_of(l2.begin(), l2.end(), [](char b) { return b == '?'; }));
+    auto mixed = requester->get_into_ranges(
+        {l2.data()}, {{"memory"}}, {{{0, 32}}}, {{{0, 0}}}, {{{16, 32}}});
+    EXPECT_EQ(mixed[0][0][0], 16);
+    EXPECT_LT(mixed[0][0][1], 0);
+    EXPECT_TRUE(std::all_of(l2.begin(), l2.begin() + 16,
+                            [](char b) { return b == 'M'; }));
+    EXPECT_TRUE(std::all_of(l2.begin() + 16, l2.end(),
+                            [](char b) { return b == '?'; }));
+    EXPECT_EQ(requester->tearDownAll(), int(ErrorCode::OBJECT_HAS_LEASE));
+    EXPECT_NE(requester->get_ssd_push_peer_info(), "{}");
+    EXPECT_EQ(requester->unregister_buffer(idle.data()), 0);
+    release.Now();
+    EXPECT_EQ(read.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    auto timed_out = read.get();
+    ASSERT_TRUE(timed_out);
+    EXPECT_FALSE(*timed_out);  // A late successful write cannot undo timeout.
+    EXPECT_EQ(requester->recover_ssd_push(), 0);
+    EXPECT_TRUE(std::all_of(l2.begin() + 32, l2.end(),
+                            [](char b) { return b == 'S'; }));
+    l2.fill('R');  // Immediate page reuse is legal after an error return.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_TRUE(
+        std::all_of(l2.begin(), l2.end(), [](char b) { return b == 'R'; }));
+    EXPECT_EQ(requester->unregister_buffer(l2.data()), 0);
+    EXPECT_EQ(requester->tearDownAll(), 0);
+    endpoint.CloseAndDrain();
+    server.stop();
+    EXPECT_EQ(owner_engine->unregisterLocalMemory(source.data()), 0);
+}
+TEST_F(RealClientTest,
+       FixedL2DirectSsdRestoreUsesOneRpcAndNoWholeObjectOwnerBuffer) {
+    RunFixedL2DirectRestore(false);
+}
+TEST_F(RealClientTest,
+       FixedL2AutomaticBootstrapUsesExistingStoreApiAndOneReadRpc) {
+    RunFixedL2DirectRestore(true);
+}
+void RealClientTest::RunFixedL2DirectRestore(bool automatic_bootstrap) {
+    ScopedEnvVar push("MOONCAKE_OFFLOAD_SSD_PUSH", "true");
+    ScopedEnvVar native("MOONCAKE_OFFLOAD_STREAM_USE_URING", "true");
+    ScopedEnvVar arena("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "524288");
+    ScopedEnvVar slot("MOONCAKE_OFFLOAD_STREAM_SLOT_BYTES", "65536");
+    ScopedEnvVar slots("MOONCAKE_OFFLOAD_STREAM_SLOTS", "2");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    char path[] = "/tmp/mooncake_fixed_l2_XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    ssd_path_ = path;
+    const auto peer_path = ssd_path_ + "/trusted-peers";
+    std::unique_ptr<ScopedEnvVar> peers;
+    if (automatic_bootstrap) {
+        ASSERT_EQ(mkdir(peer_path.c_str(), 0700), 0);
+        peers = std::make_unique<ScopedEnvVar>(
+            "MOONCAKE_OFFLOAD_SSD_PEER_DIRECTORY", peer_path.c_str());
+    }
+    // Snapshot reads cannot renew their lease. Allow native ring registration
+    // and I/O under the low-priority test budget; TTL is in milliseconds.
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(1000)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+    auto requester = RealClient::create();
+    ASSERT_EQ(
+        requester->setup_real("localhost:17814", "P2PHANDSHAKE", 0,
+                              16 * 1024 * 1024, "tcp", "", master_address_),
+        0);
+    const auto owner_info = py_client_->get_ssd_push_peer_info();
+    const auto requester_info = requester->get_ssd_push_peer_info();
+    if (owner_info == "{}" || requester_info == "{}")
+        GTEST_SKIP() << "Fixed L2 adapter requires classic TE";
+    ASSERT_NE(owner_info, "{}");
+    ASSERT_NE(requester_info, "{}");
+    if (!automatic_bootstrap) {
+        ASSERT_EQ(py_client_->configure_ssd_push_peers({requester_info}), 0);
+        ASSERT_EQ(requester->configure_ssd_push_peers({owner_info}), 0);
+    }
+    const std::string key = "fixed-l2-direct";
+    std::vector<char> source(3 * 1024 * 1024 + 123);
+    for (size_t i = 0; i < source.size(); ++i) source[i] = char(i % 251);
+    ASSERT_EQ(py_client_->put(key, source), 0);
+    bool ready = false;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!ready && std::chrono::steady_clock::now() < deadline) {
+        auto queries = QueryOnlyLocalDisk({key});
+        ready = queries[0] && !queries[0]->replicas.empty();
+        if (!ready) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(ready);
+    std::vector<char> l2(source.size() + 64, '?');
+    ASSERT_EQ(requester->register_buffer(l2.data(), l2.size()), 0);
+    const auto read = [&](const std::string& endpoint,
+                          RealClient::LocalDiskOffloadObjects& objects) {
+        return requester->batch_get_into_offload_object_internal(endpoint,
+                                                                 objects);
+    };
+    for (size_t pass = 0; pass < 2; ++pass) {
+        auto restored = requester->batch_get_into_internal(
+            {key}, {l2.data() + 32}, {source.size()}, QueryOnlyLocalDisk({key}),
+            read);
+        ASSERT_EQ(restored.size(), 1u);
+        ASSERT_TRUE(restored[0]);
+        EXPECT_EQ(*restored[0], int64_t(source.size()));
+        EXPECT_EQ(std::memcmp(l2.data() + 32, source.data(), source.size()), 0);
+        EXPECT_EQ(l2.front(), '?');
+        EXPECT_EQ(l2.back(), '?');
+    }
+    PyClient::QueryResultCache snapshot;
+    snapshot.emplace(key, QueryOnlyLocalDisk({key})[0]);
+    auto ranged = requester->get_into_ranges_from_snapshot(
+        {l2.data()}, {{key}}, {{{32}}}, {{{12345}}}, {{{150000}}}, snapshot);
+    EXPECT_EQ(ranged[0][0][0], 150000);
+    EXPECT_EQ(std::memcmp(l2.data() + 32, source.data() + 12345, 150000), 0);
+    // Exercise the same public flat/nested APIs that FluentLLM uses, with a
+    // real Master LOCAL_DISK result rather than the snapshot test seam.
+    // The previous snapshot/range read still holds the Master's lease.
+    // Clear MEMORY only after that lease expires, without refreshing Query.
+    std::vector<std::string> cleared;
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (cleared.empty() &&
+           std::chrono::steady_clock::now() < clear_deadline) {
+        cleared = py_client_->batch_replica_clear({key}, "localhost:17813");
+        if (cleared.empty())
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_EQ(cleared.size(), 1u);
+    auto disk_only = requester->batch_query({key});
+    ASSERT_TRUE(disk_only[0]);
+    ASSERT_EQ(disk_only[0]->replicas.size(), 1u);
+    ASSERT_TRUE(disk_only[0]->replicas[0].is_local_disk_replica());
+    std::fill(l2.begin(), l2.end(), '?');
+    EXPECT_EQ(requester->batch_get_into({key}, {l2.data() + 32},
+                                        {source.size()}, 2000),
+              std::vector<int64_t>{int64_t(source.size())});
+    EXPECT_EQ(std::memcmp(l2.data() + 32, source.data(), source.size()), 0);
+    std::fill(l2.begin(), l2.end(), '?');
+    constexpr size_t split = 1024 * 1024 + 7;
+    EXPECT_EQ(requester->batch_get_into_multi_buffers(
+                  {key}, {{l2.data() + 32, l2.data() + 32 + split}},
+                  {{split, source.size() - split}}, false, 2000),
+              std::vector<int>{int(source.size())});
+    EXPECT_EQ(std::memcmp(l2.data() + 32, source.data(), source.size()), 0);
+    EXPECT_EQ(l2.front(), '?');
+    EXPECT_EQ(l2.back(), '?');
+    EXPECT_NE(py_client_->get_ssd_push_peer_info().find("\"read_requests\":5"),
+              std::string::npos);
+    EXPECT_EQ(requester->unregister_buffer(l2.data()), 0);
+    EXPECT_EQ(requester->tearDownAll(), 0);
+    EXPECT_EQ(py_client_->tearDownAll(), 0);
+    if (automatic_bootstrap) {
+        EXPECT_TRUE(std::filesystem::is_empty(peer_path));
+        EXPECT_TRUE(std::filesystem::remove(peer_path));
+    }
+}
+}  // namespace mooncake::testing

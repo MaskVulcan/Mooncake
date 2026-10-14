@@ -42,6 +42,13 @@ class ScopedEnvVar {
 };
 
 struct FileStorageEnvironment {
+    ScopedEnvVar streaming_enable{"MOONCAKE_OFFLOAD_LOCAL_STREAMING_READ"};
+    ScopedEnvVar streaming_slots{"MOONCAKE_OFFLOAD_STREAM_SLOTS"};
+    ScopedEnvVar streaming_bytes{"MOONCAKE_OFFLOAD_STREAM_SLOT_BYTES"};
+    ScopedEnvVar streaming_reads{"MOONCAKE_OFFLOAD_STREAM_READ_THREADS"};
+    ScopedEnvVar streaming_writes{"MOONCAKE_OFFLOAD_STREAM_WRITE_THREADS"};
+    ScopedEnvVar streaming_outstanding{
+        "MOONCAKE_OFFLOAD_STREAM_MAX_OUTSTANDING"};
     ScopedEnvVar storage_backend_descriptor{
         "MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR"};
     ScopedEnvVar storage_path{"MOONCAKE_OFFLOAD_FILE_STORAGE_PATH"};
@@ -338,5 +345,73 @@ TEST_F(FileStorageConfigTest, ValidateFailsOnInvalidLimits) {
 }
 
 }  // namespace
+
+TEST(FileStorageStreamingConfig, ExplicitOptionAndArenaLimits) {
+    ScopedEnvVar enable("MOONCAKE_OFFLOAD_LOCAL_STREAMING_READ");
+    ScopedEnvVar slots("MOONCAKE_OFFLOAD_STREAM_SLOTS");
+    ScopedEnvVar bytes("MOONCAKE_OFFLOAD_STREAM_SLOT_BYTES");
+    EXPECT_FALSE(FileStorageConfig::FromEnvironment().streaming_read.enabled);
+    enable.Set("true");
+    slots.Set("2");
+    bytes.Set("4096");
+    const auto config = FileStorageConfig::FromEnvironment();
+    EXPECT_TRUE(config.streaming_read.enabled);
+    EXPECT_EQ(config.streaming_read.slots, 2u);
+    EXPECT_EQ(config.streaming_read.slot_bytes, 4096u);
+    EXPECT_TRUE(config.streaming_read.Validate(32768));
+    EXPECT_FALSE(config.streaming_read.Validate(4096));
+}
+
+TEST(FileStorageStreamingConfig, PushOptionDoesNotEnableLocalCopy) {
+    ScopedEnvVar local("MOONCAKE_OFFLOAD_LOCAL_STREAMING_READ");
+    ScopedEnvVar push("MOONCAKE_OFFLOAD_SSD_PUSH");
+    EXPECT_FALSE(
+        FileStorageConfig::FromEnvironment().streaming_read.push_enabled);
+    push.Set("true");
+    const auto config = FileStorageConfig::FromEnvironment();
+    EXPECT_TRUE(config.streaming_read.push_enabled);
+    EXPECT_FALSE(config.streaming_read.enabled);
+    EXPECT_FALSE(config.streaming_read.Validate(4096));
+}
+TEST(FileStorageStreamingConfig,
+     PushDefaultsFitFluentBatchAndRespectOverrides) {
+    ScopedEnvVar local("MOONCAKE_OFFLOAD_LOCAL_STREAMING_READ");
+    ScopedEnvVar push("MOONCAKE_OFFLOAD_SSD_PUSH");
+    ScopedEnvVar outstanding("MOONCAKE_OFFLOAD_STREAM_MAX_OUTSTANDING");
+    EXPECT_EQ(
+        FileStorageConfig::FromEnvironment().streaming_read.max_outstanding,
+        64u);
+    local.Set("true");
+    EXPECT_EQ(
+        FileStorageConfig::FromEnvironment().streaming_read.max_outstanding,
+        64u);
+    push.Set("true");
+    EXPECT_EQ(
+        FileStorageConfig::FromEnvironment().streaming_read.max_outstanding,
+        512u);
+    outstanding.Set("64");
+    EXPECT_EQ(
+        FileStorageConfig::FromEnvironment().streaming_read.max_outstanding,
+        64u);
+    outstanding.Set("1024");
+    EXPECT_EQ(
+        FileStorageConfig::FromEnvironment().streaming_read.max_outstanding,
+        1024u);
+}
+
+template <typename Config>
+bool PreservesLegacyAggregateInitialization() {
+    if constexpr (requires { Config{StorageBackendType::kBucket, "/tmp"}; }) {
+        const Config config{StorageBackendType::kBucket, "/tmp"};
+        return config.storage_backend_type == StorageBackendType::kBucket &&
+               config.storage_filepath == "/tmp" &&
+               !config.streaming_read.enabled;
+    }
+    return false;
+}
+
+TEST(FileStorageStreamingConfig, PreservesLegacyAggregateInitialization) {
+    EXPECT_TRUE(PreservesLegacyAggregateInitialization<FileStorageConfig>());
+}
 
 }  // namespace mooncake

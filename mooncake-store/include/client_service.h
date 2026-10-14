@@ -215,13 +215,15 @@ class Client {
      * @param object_keys Keys of the objects
      * @param query_results Previously queried object metadata for each key
      * @param slices Map of object keys to their data slices
+     * @param timeout_ms Logical read deadline. Expiry stops new submissions;
+     * accepted I/O drains before return, which may outlast this budget.
      * @return Vector of ErrorCode results for each object
      */
     std::vector<tl::expected<void, ErrorCode>> BatchGet(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool prefer_same_node = false);
+        bool prefer_same_node = false, int64_t timeout_ms = 0);
 
     /**
      * @brief Stores data with replication
@@ -625,13 +627,16 @@ class Client {
         const std::unordered_map<std::string, std::vector<Slice>>&
             batch_slices);
 
+    // timeout_ms applies to submission and waiting. On every return, accepted
+    // transfers have stopped accessing the caller's destination buffers.
     tl::expected<void, ErrorCode> BatchGetOffloadObject(
         const std::string& transfer_engine_addr,
         const std::vector<std::string>& keys,
         const std::vector<uintptr_t>& pointers,
         const std::unordered_map<std::string, std::vector<Slice>>& batch_slices,
         OffloadBufferAccess buffer_access,
-        TransferIntent intent = TransferIntent::kForegroundGet);
+        TransferIntent intent = TransferIntent::kForegroundGet,
+        int64_t timeout_ms = 0);
 
     /**
      * @brief Notifies the master that offloading of specified objects has
@@ -711,7 +716,14 @@ class Client {
         return transfer_engine_->getLocalIpAndPort();
     }
 
+    void RetainTransferBacking(std::shared_ptr<void> backing) {
+        transfer_engine_->retainLocalMemory(std::move(backing));
+    }
+
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
+    std::shared_ptr<TransferEngine> GetTransferEngine() const {
+        return transfer_engine_;
+    }
 
     [[nodiscard]] bool CanUseLocalMemcpy(const std::string& endpoint) const {
         return transfer_submitter_ != nullptr &&
@@ -1001,7 +1013,8 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
-        std::unordered_map<std::string, std::vector<Slice>>& slices);
+        std::unordered_map<std::string, std::vector<Slice>>& slices,
+        std::chrono::steady_clock::time_point deadline);
     ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
 
     // Client identification

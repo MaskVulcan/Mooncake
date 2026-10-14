@@ -47,6 +47,112 @@ add_store_test(replica_allocator_test replica_allocator_test.cpp)
 add_store_test(segment_pool_test segment_pool_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(batch_read_fanout_test batch_read_fanout_test.cpp)
+add_store_test(ssd_read_pipeline_test ssd_read_pipeline_test.cpp)
+add_store_test(ssd_read_source_test ssd_read_source_test.cpp)
+add_store_test(ssd_pipeline_io_test ssd_pipeline_io_test.cpp)
+add_store_test(ssd_uring_pipeline_test ssd_uring_pipeline_test.cpp)
+if(TARGET Mooncake::liburing)
+  # Isolated eventfd fault injection; link the exact driver without Store.
+  add_executable(
+    ssd_uring_shutdown_test
+    ssd_uring_shutdown_test.cpp ../src/ssd_read_pipeline.cpp
+    ../src/ssd_read_source.cpp ../src/ssd_pipeline_io.cpp
+    ../src/ssd_uring_pipeline.cpp)
+  target_include_directories(ssd_uring_shutdown_test PRIVATE ../include)
+  target_compile_definitions(ssd_uring_shutdown_test PRIVATE USE_URING)
+  target_link_libraries(ssd_uring_shutdown_test
+                        PRIVATE gtest_main Mooncake::liburing pthread)
+  add_test(NAME ssd_uring_shutdown_test COMMAND ssd_uring_shutdown_test)
+  set_tests_properties(ssd_uring_shutdown_test PROPERTIES TIMEOUT 30)
+endif()
+add_store_test(ssd_streaming_config_test ssd_streaming_config_test.cpp)
+add_store_test(ssd_destination_registry_test ssd_destination_registry_test.cpp)
+add_store_test(ssd_destination_registration_test
+               ssd_destination_registration_test.cpp)
+add_store_test(secure_random_test secure_random_test.cpp)
+# This runtime test links TE directly so CPU/TCP validation need not build a
+# master, NPU bindings, or the complete Store service.
+add_executable(
+  ssd_destination_tcp_test
+  ssd_destination_tcp_test.cpp
+  ../src/ssd_destination_registry.cpp
+  ../src/ssd_destination_registration.cpp
+  ../src/ssd_transfer_registration.cpp
+  ../src/ssd_read_pipeline.cpp
+  ../src/ssd_read_source.cpp
+  ../src/ssd_transfer_target.cpp)
+target_include_directories(ssd_destination_tcp_test PRIVATE ../include)
+target_link_libraries(ssd_destination_tcp_test PRIVATE transfer_engine
+                                                       gtest_main)
+add_test(NAME ssd_destination_tcp_test COMMAND ssd_destination_tcp_test)
+add_executable(ssd_destination_rdma_test ssd_destination_rdma_test.cpp
+                                         ../src/ssd_transfer_target.cpp)
+target_include_directories(ssd_destination_rdma_test PRIVATE ../include)
+target_link_libraries(ssd_destination_rdma_test PRIVATE transfer_engine
+                                                        gtest_main)
+add_test(NAME ssd_destination_rdma_test COMMAND ssd_destination_rdma_test)
+set_tests_properties(ssd_destination_rdma_test PROPERTIES TIMEOUT 30)
+if(USE_TENT)
+  target_compile_definitions(ssd_destination_tcp_test PRIVATE USE_TENT)
+  add_executable(ssd_tent_scatter_exception_test
+                 ssd_tent_scatter_exception_test.cpp)
+  target_compile_definitions(ssd_tent_scatter_exception_test PRIVATE USE_TENT)
+  target_link_libraries(ssd_tent_scatter_exception_test PRIVATE transfer_engine
+                                                                gtest_main)
+  add_test(NAME ssd_tent_scatter_exception_test
+           COMMAND ssd_tent_scatter_exception_test)
+  set_tests_properties(ssd_tent_scatter_exception_test PROPERTIES TIMEOUT 30)
+endif()
+set_tests_properties(ssd_destination_tcp_test PROPERTIES TIMEOUT 180)
+add_executable(ssd_scatter_allocation_test ssd_scatter_allocation_test.cpp)
+target_link_libraries(ssd_scatter_allocation_test PRIVATE transfer_engine
+                                                          gtest_main)
+add_test(NAME ssd_scatter_allocation_test COMMAND ssd_scatter_allocation_test)
+set_tests_properties(ssd_scatter_allocation_test PROPERTIES TIMEOUT 30)
+add_store_test(ssd_read_protocol_test ssd_read_protocol_test.cpp)
+add_store_test(ssd_read_control_test ssd_read_control_test.cpp)
+add_store_test(ssd_direct_read_test ssd_direct_read_test.cpp)
+add_store_test(ssd_fixed_l2_requester_test ssd_fixed_l2_requester_test.cpp)
+add_store_test(ssd_peer_directory_test ssd_peer_directory_test.cpp)
+add_store_test(ssd_runtime_capacity_test ssd_runtime_capacity_test.cpp)
+target_link_libraries(ssd_runtime_capacity_test PRIVATE gflags::gflags)
+set_tests_properties(ssd_runtime_capacity_test PROPERTIES TIMEOUT 180)
+add_executable(
+  ssd_peer_directory_allocation_test ssd_peer_directory_allocation_test.cpp
+                                     ../src/ssd_peer_directory.cpp)
+target_include_directories(ssd_peer_directory_allocation_test
+                           PRIVATE ../include)
+target_link_libraries(
+  ssd_peer_directory_allocation_test PRIVATE gtest_main JsonCpp::JsonCpp
+                                             pthread ${CMAKE_DL_LIBS})
+add_test(NAME ssd_peer_directory_allocation_test
+         COMMAND ssd_peer_directory_allocation_test)
+set_tests_properties(ssd_peer_directory_allocation_test PROPERTIES TIMEOUT 30)
+add_store_test(ssd_runtime_lifetime_test ssd_runtime_lifetime_test.cpp)
+target_link_libraries(ssd_runtime_lifetime_test PRIVATE gflags::gflags)
+set_tests_properties(ssd_runtime_lifetime_test PROPERTIES TIMEOUT 30)
+add_store_test(ssd_owner_read_worker_test ssd_owner_read_worker_test.cpp)
+add_store_test(ssd_push_requester_test ssd_push_requester_test.cpp)
+add_store_test(ssd_requester_allocation_test ssd_requester_allocation_test.cpp)
+add_store_test(ssd_control_wire_test ssd_control_wire_test.cpp)
+add_executable(
+  ssd_control_rpc_test
+  ssd_control_rpc_test.cpp
+  ../src/ssd_direct_read.cpp
+  ../src/ssd_read_control.cpp
+  ../src/ssd_control_wire.cpp
+  ../src/ssd_control_rpc.cpp
+  ../src/ssd_destination_registry.cpp
+  ../src/ssd_read_protocol.cpp
+  ../src/ssd_pipeline_io.cpp
+  ../src/ssd_destination_registration.cpp
+  ../src/ssd_transfer_registration.cpp)
+target_include_directories(ssd_control_rpc_test PRIVATE ../include)
+target_link_libraries(ssd_control_rpc_test PRIVATE transfer_engine gtest_main)
+add_test(NAME ssd_control_rpc_test COMMAND ssd_control_rpc_test)
+set_tests_properties(ssd_control_rpc_test PROPERTIES TIMEOUT 30)
+add_store_test(ssd_read_protocol_codec_test ssd_read_protocol_codec_test.cpp)
+add_store_test(ssd_registered_read_test ssd_registered_read_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(client_liveness_test client_liveness_test.cpp)
@@ -180,7 +286,7 @@ endif()
 add_store_test(transfer_submitter_config_test
                transfer_submitter_config_test.cpp)
 find_package(CUDAToolkit QUIET)
-if(CUDAToolkit_FOUND)
+if(USE_CUDA AND CUDAToolkit_FOUND)
   target_compile_definitions(transfer_task_test PRIVATE MOONCAKE_TEST_CUDA_H2D)
   target_link_libraries(transfer_task_test PRIVATE CUDA::cudart)
 endif()
@@ -196,15 +302,14 @@ if(USE_TENT)
       --gtest_filter=TransferTaskTest.TransferScatterHandlesFragmentedCpuBuffers
   )
   set_tests_properties(transfer_scatter_tent_test PROPERTIES ENVIRONMENT
-                                                           "MC_USE_TENT=1")
+                                                             "MC_USE_TENT=1")
   add_test(
     NAME transfer_submitter_scatter_tent_test
     COMMAND
       transfer_task_test
-      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath
-  )
-  set_tests_properties(transfer_submitter_scatter_tent_test PROPERTIES
-                       ENVIRONMENT "MC_USE_TENT=1")
+      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath)
+  set_tests_properties(transfer_submitter_scatter_tent_test
+                       PROPERTIES ENVIRONMENT "MC_USE_TENT=1")
 endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_manager_test tenant_quota_manager_test.cpp)
@@ -247,8 +352,10 @@ add_store_test(cxl_segment_config_test cxl_segment_config_test.cpp)
 add_store_test(client_numa_config_test client_numa_config_test.cpp)
 add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
-add_store_test(real_client_hugepage_register_test real_client_hugepage_register_test.cpp)
-add_store_test(real_client_regular_page_register_test real_client_regular_page_register_test.cpp)
+add_store_test(real_client_hugepage_register_test
+               real_client_hugepage_register_test.cpp)
+add_store_test(real_client_regular_page_register_test
+               real_client_regular_page_register_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(standalone_client_test standalone_client_test.cpp)
@@ -498,3 +605,12 @@ foreach(
 endforeach()
 
 add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+
+add_executable(offload_read_executor_config_test
+               offload_read_executor_config_test.cpp)
+target_include_directories(offload_read_executor_config_test
+                           PRIVATE ../include ../../mooncake-common/include)
+target_link_libraries(offload_read_executor_config_test PRIVATE gtest
+                                                                gtest_main)
+add_test(NAME offload_read_executor_config_test
+         COMMAND offload_read_executor_config_test)

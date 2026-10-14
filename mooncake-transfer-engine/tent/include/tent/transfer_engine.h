@@ -352,6 +352,8 @@ class TransferEngine {
 
     Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
 
+    Status getBatchDrainStatus(BatchID batch_id, bool& drained);
+
     // Drive one progress step on a batch and return its aggregated status.
     // Unlike getTransferStatus, this always allows internal failover/resubmit
     // regardless of enable_auto_failover_on_poll. The call is non-blocking and
@@ -362,10 +364,19 @@ class TransferEngine {
 
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
+    void retainLocalMemory(std::shared_ptr<void> backing) {
+        std::lock_guard lock(retained_memory_mutex_);
+        retained_memory_.push_back(std::move(backing));
+    }
+
    private:
     Status submitTransferRequiringPostSubmitCancellation(
         BatchID batch_id, const std::vector<Request>& request_list);
 
+    // The native engine is shared by pending Scatter operations. Its impl
+    // (and all transports) is destroyed before these allocations.
+    std::vector<std::shared_ptr<void>> retained_memory_;
+    std::mutex retained_memory_mutex_;
     std::unique_ptr<TransferEngineImpl> impl_;
     friend class ::mooncake::TransferEngine;
     friend class ::mooncake::TransferEngineImplTestPeer;

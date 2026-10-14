@@ -194,12 +194,12 @@ target_include_directories(local_notification_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME local_notification_test COMMAND local_notification_test)
 
-# Notification fallback: an unavailable RDMA notification channel falls back
-# to the next transport and then to the control-plane RPC, and receive drains
-# every transport. Loopback only, no NIC required.
+# Notification fallback: an unavailable RDMA notification channel falls back to
+# the next transport and then to the control-plane RPC, and receive drains every
+# transport. Loopback only, no NIC required.
 add_executable(tent_notification_fallback_test notification_fallback_test.cpp)
-target_link_libraries(tent_notification_fallback_test
-                      PRIVATE gtest gtest_main tent_link_group)
+target_link_libraries(tent_notification_fallback_test PRIVATE gtest gtest_main
+                                                              tent_link_group)
 target_include_directories(tent_notification_fallback_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_notification_fallback_test
@@ -704,6 +704,19 @@ target_include_directories(tent_runtime_queue_dispatch_test
 add_test(NAME tent_runtime_queue_dispatch_test
          COMMAND tent_runtime_queue_dispatch_test)
 
+# Fault injection is isolated so its operator new cannot affect other suites.
+foreach(test_name IN ITEMS submit_exception_drain proxy_submission_lifetime)
+  add_executable(tent_${test_name}_test ${test_name}_test.cpp)
+  target_link_libraries(tent_${test_name}_test PRIVATE gtest gtest_main
+                                                       tent_link_group)
+  if(TARGET asio_shared)
+    target_link_libraries(tent_${test_name}_test PRIVATE asio_shared)
+  endif()
+  target_include_directories(tent_${test_name}_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_${test_name}_test COMMAND tent_${test_name}_test)
+endforeach()
+
 add_executable(tent_local_memory_lifecycle_test local_memory_lifecycle_test.cpp)
 target_link_libraries(tent_local_memory_lifecycle_test PRIVATE gtest gtest_main
                                                                tent_link_group)
@@ -851,8 +864,7 @@ set_tests_properties(tent_segment_desc_retry_test PROPERTIES TIMEOUT 60)
 
 # Fabric transport: attribute codec and slicing math, plus end-to-end cases on
 # libfabric's tcp;ofi_rxm provider (no fabric hardware needed). Each e2e case
-# forks a server before the client engine starts, so it runs in its own
-# process.
+# forks a server before the client engine starts, so it runs in its own process.
 if(TARGET tent_xport_fabric)
   add_executable(tent_fabric_attrs_test fabric_attrs_test.cpp)
   target_link_libraries(tent_fabric_attrs_test PRIVATE gtest gtest_main

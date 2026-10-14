@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <unordered_set>
+#include <future>
 #include <string>
 #include <thread>
 
@@ -15,6 +16,11 @@
 #include "client_metric.h"
 #include "common/network.h"
 #include "file_storage.h"
+#include "ssd_control_rpc.h"
+#include "ssd_file_storage_owner_reader.h"
+#include "ssd_transfer_registration.h"
+#include "ssd_transfer_target.h"
+#include "transfer_engine.h"
 #include "storage_backend.h"
 #include "tenant_id.h"
 #include "test_server_helpers.h"
@@ -196,6 +202,40 @@ class FileStorageTest : public ::testing::Test {
         EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
     }
 
+    void RunOwnerControlRestore(bool tcp);
+    void InstallNativeOnlyBackend(FileStorage& storage,
+                                  const FileStorageConfig& config) {
+        struct NativeSource final : ssd_offload::ReadSource {
+            explicit NativeSource(
+                std::shared_ptr<ssd_offload::ReadSource> source)
+                : source(std::move(source)) {}
+            ssd_offload::ReadSourceInfo info() const noexcept override {
+                return source->info();
+            }
+            std::optional<int> native_read_fd() const noexcept override {
+                return source->native_read_fd();
+            }
+            ssd_offload::ReadResult ReadAt(std::span<std::byte>,
+                                           uint64_t) noexcept override {
+                return {0, ssd_offload::Error::kIoError};  // Must use actual
+                                                           // kernel CQEs.
+            }
+            std::shared_ptr<ssd_offload::ReadSource> source;
+        };
+        struct NativeBackend final : BucketStorageBackend {
+            using BucketStorageBackend::BucketStorageBackend;
+            tl::expected<std::shared_ptr<ssd_offload::ReadSource>, ErrorCode>
+            AcquireReadSource(const std::string& key, uint64_t bytes) override {
+                auto source =
+                    BucketStorageBackend::AcquireReadSource(key, bytes);
+                if (!source) return tl::unexpected(source.error());
+                return std::shared_ptr<ssd_offload::ReadSource>(
+                    std::make_shared<NativeSource>(*source));
+            }
+        };
+        storage.storage_backend_ = std::make_shared<NativeBackend>(
+            config, BucketBackendConfig::FromEnvironment());
+    }
     void SetUp() override {
         google::InitGoogleLogging("FileStorageTest");
         FLAGS_logtostderr = true;
@@ -218,6 +258,7 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO");
         UnsetEnv("MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO");
         UnsetEnv("MOONCAKE_OFFLOAD_USE_URING");
+        UnsetEnv("MOONCAKE_OFFLOAD_LOCAL_STREAMING_READ");
         UnsetEnv("MOONCAKE_USE_URING");
         UnsetEnv("MOONCAKE_DISTRIBUTED_FS_TYPE");
         UnsetEnv("MOONCAKE_DFS_FS_ADAPTER");
@@ -265,9 +306,86 @@ class FileStorageTest : public ::testing::Test {
         return fileStorage.BatchLoad(batch_object);
     }
 
+    void PrepareStreamingObject(FileStorage& storage, const std::string& key,
+                                std::string& value) {
+        ASSERT_TRUE(storage.storage_backend_->Init());
+        ASSERT_TRUE(storage.storage_backend_->BatchOffload(
+            {{key, {{value.data(), value.size()}}}},
+            [](const auto&, auto&) { return ErrorCode::OK; }));
+    }
+
+    void PrepareStreamingBatch(
+        FileStorage& storage,
+        const std::unordered_map<std::string, std::vector<Slice>>& values) {
+        ASSERT_TRUE(storage.storage_backend_->Init());
+        std::vector<int64_t> buckets;
+        for (const auto& [key, slices] : values) {
+            auto result = storage.storage_backend_->BatchOffload(
+                {{key, slices}},
+                [](const auto&, auto&) { return ErrorCode::OK; });
+            ASSERT_TRUE(result);
+            EXPECT_EQ(std::count(buckets.begin(), buckets.end(), *result), 0);
+            buckets.push_back(*result);
+        }
+    }
+
+    static FileStorageConfig OwnerConfig(const std::string& path) {
+        FileStorageConfig config;
+        config.storage_filepath = path;
+        config.local_buffer_size = 512 * 1024;
+        config.streaming_read.push_enabled = true;
+        config.streaming_read.slot_bytes = 64 * 1024;
+        config.streaming_read.slots = 1;
+        return config;
+    }
+    static ssd_offload::SsdReadRequestV1 OwnerRequest(const std::string& key,
+                                                      size_t object_size,
+                                                      size_t length,
+                                                      size_t offset = 0) {
+        using namespace ssd_offload;
+        const PeerIdentity requester{1, 2, 3}, owner{4, 5, 6};
+        const DestinationRegion region{requester, 1, 1, {7, 8}};
+        return {1,
+                requester,
+                {owner, 1, 1},
+                "owner-tenant",
+                5000,
+                0,
+                {{key, object_size, {}, {{offset, {{region, 0, length}}}}}}};
+    }
+
+    std::optional<BufferHandle> ReserveStreamingArena(FileStorage& storage,
+                                                      size_t bytes) {
+        return storage.client_buffer_allocator_->allocate(bytes);
+    }
+
+    std::shared_ptr<void> RegisterStreamingArena(
+        std::shared_ptr<FileStorage> storage,
+        std::shared_ptr<TransferEngine> engine) {
+        void* base = storage->client_buffer_allocator_->getBase();
+        if (engine->registerLocalMemory(
+                base, storage->client_buffer_allocator_->size(), "cpu:0", true,
+                true) != 0)
+            return {};
+        return std::shared_ptr<void>(
+            base, [storage = std::move(storage),
+                   engine = std::move(engine)](void* pointer) {
+                EXPECT_EQ(engine->unregisterLocalMemory(pointer, true), 0);
+            });
+    }
+
     tl::expected<bool, ErrorCode> FileStorageIsEnableOffloading(
         FileStorage& fileStorage) {
         return fileStorage.IsEnableOffloading();
+    }
+
+    bool SubmitStreamingReadTask(FileStorage& storage,
+                                 std::function<void()> task) {
+        return storage.streaming_reads_->TrySubmit(std::move(task));
+    }
+    size_t ActiveStreamingSources(FileStorage& storage) {
+        return storage.active_streaming_sources_.load(
+            std::memory_order_relaxed);
     }
 
     bool FileStorageUsesDfsControlPlane(const FileStorage& file_storage) {
@@ -1367,4 +1485,772 @@ TEST_F(FileStorageTest,
     RunBatchPutHealWipeScenario(data_path);
 }
 
+TEST_F(FileStorageTest, LocalStreamingRestoreExceedsStagingArenaCapacity) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    config.streaming_read.enabled = true;
+    config.use_uring =
+        std::getenv("MOONCAKE_SSD_TEST_URING") &&
+        std::string(std::getenv("MOONCAKE_SSD_TEST_URING")) == "1";
+    FileStorage storage(config, nullptr, "local");
+    std::string value(20 * 1024 * 1024, 's');
+    for (size_t i = 0; i < value.size(); ++i) value[i] = char(i % 251);
+    PrepareStreamingObject(storage, "stream-key", value);
+    ASSERT_TRUE(storage.SupportsLocalStreamingRead());
+    std::vector<char> first(12 * 1024 * 1024), second(8 * 1024 * 1024);
+    ASSERT_TRUE(storage.ReadLocalStreaming(
+        {{"stream-key",
+          value.size(),
+          0,
+          {{first.data(), first.size()}, {second.data(), second.size()}}}}));
+    EXPECT_EQ(std::memcmp(first.data(), value.data(), first.size()), 0);
+    EXPECT_EQ(
+        std::memcmp(second.data(), value.data() + first.size(), second.size()),
+        0);
+}
+
+namespace {
+class OwnerCopyTarget final : public ssd_offload::SourceDrainedWriteTarget {
+   public:
+    explicit OwnerCopyTarget(std::vector<Slice> views)
+        : views(std::move(views)) {}
+    ssd_offload::Error WriteAndDrain(
+        const ssd_offload::ReadChunk& chunk,
+        ssd_offload::SlotBuffer slot) noexcept override {
+        ++writes;
+        if (entered && !signalled.exchange(true)) entered->set_value();
+        if (release.valid()) release.wait();
+        if (fail) return ssd_offload::Error::kTransferError;
+        for (const auto& fragment : chunk.fragments) {
+            const auto& d = fragment.destination;
+            if (!d.region_id || d.region_id > views.size() || d.generation != 1)
+                return ssd_offload::Error::kInvalidArgument;
+            const auto& view = views[d.region_id - 1];
+            if (d.offset > view.size || d.length > view.size - d.offset ||
+                fragment.buffer_offset > slot.capacity ||
+                d.length > slot.capacity - fragment.buffer_offset)
+                return ssd_offload::Error::kInvalidArgument;
+            std::memcpy(static_cast<char*>(view.ptr) + d.offset,
+                        slot.data + fragment.buffer_offset, d.length);
+        }
+        return ssd_offload::Error::kOk;
+    }
+    bool DestinationsDrained() const noexcept override { return drained; }
+    std::vector<Slice> views;
+    std::atomic<size_t> writes{0};
+    bool fail{false}, drained{true};
+    std::promise<void>* entered{nullptr};
+    std::shared_future<void> release;
+    std::atomic<bool> signalled{false};
+};
+class OwnerTestRegistration final
+    : public ssd_offload::DestinationRegistrationTransport {
+   public:
+    ssd_offload::TransportRegistrationResult RegisterWritable(
+        const ssd_offload::DestinationBinding&,
+        const std::string&) noexcept override {
+        return {ssd_offload::DestinationError::kOk, true, true};
+    }
+    ssd_offload::DestinationError Unregister(uint64_t) noexcept override {
+        return ssd_offload::DestinationError::kOk;
+    }
+};
+}  // namespace
+
+TEST_F(FileStorageTest, OwnerStreamingRemainsIndependentOptIn) {
+    auto config = OwnerConfig(data_path);
+    config.streaming_read.push_enabled = false;
+    config.streaming_read.enabled = true;
+    FileStorage local(config, nullptr, "local");
+    EXPECT_FALSE(local.SupportsOwnerStreamingRead());
+    auto target = std::make_shared<OwnerCopyTarget>(std::vector<Slice>{});
+    EXPECT_EQ(local
+                  .ReadOwnerStreaming(OwnerRequest("key", 0, 0), target,
+                                      std::chrono::steady_clock::now())
+                  .error(),
+              ErrorCode::NOT_SUPPORTED);
+    config.streaming_read.enabled = false;
+    config.streaming_read.push_enabled = true;
+    FileStorage owner_storage(config, nullptr, "local");
+    EXPECT_TRUE(owner_storage.SupportsOwnerStreamingRead());
+    EXPECT_FALSE(owner_storage.SupportsLocalStreamingRead());
+}
+
+TEST_F(FileStorageTest, OwnerStreamingReadsScopedBatchRangesBeyondArena) {
+    FileStorage storage(OwnerConfig(data_path), nullptr, "local");
+    std::string value(3 * 1024 * 1024 + 123, 's');
+    for (size_t i = 0; i < value.size(); ++i) value[i] = char(i % 251);
+    PrepareStreamingObject(
+        storage, TenantId("owner-tenant").MakeScopedKey("key"), value);
+    std::vector<char> first(value.size() + 64, 'z');
+    std::array<char, 128> second;
+    second.fill('z');
+    auto request = OwnerRequest("key", value.size(), value.size());
+    auto ranged = OwnerRequest("key", value.size(), 100, 70001).objects[0];
+    ranged.ranges[0].destinations[0].offset = value.size();
+    request.objects.push_back(ranged);
+    auto target = std::make_shared<OwnerCopyTarget>(std::vector<Slice>{
+        {first.data() + 32, value.size()}, {second.data() + 14, 100}});
+    auto result = storage.ReadOwnerStreaming(
+        request, target,
+        std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    ASSERT_TRUE(result) << result.error();
+    EXPECT_EQ(ssd_offload::ValidateSsdReadResultV1(request, *result),
+              ssd_offload::DestinationError::kOk);
+    ASSERT_EQ(result->objects.size(), 2u);
+    EXPECT_TRUE(result->dma_drained);
+    for (const auto& object : result->objects)
+        EXPECT_EQ(object.outcome, ssd_offload::AttemptOutcome::kSucceeded);
+    EXPECT_EQ(std::memcmp(first.data() + 32, value.data(), value.size()), 0);
+    EXPECT_EQ(std::memcmp(second.data() + 14, value.data() + 70001, 100), 0);
+    EXPECT_TRUE(std::all_of(first.begin(), first.begin() + 32,
+                            [](char c) { return c == 'z'; }));
+    EXPECT_TRUE(std::all_of(first.end() - 32, first.end(),
+                            [](char c) { return c == 'z'; }));
+    EXPECT_TRUE(std::all_of(second.begin(), second.begin() + 14,
+                            [](char c) { return c == 'z'; }));
+    EXPECT_TRUE(std::all_of(second.end() - 14, second.end(),
+                            [](char c) { return c == 'z'; }));
+    EXPECT_GT(target->writes.load(), 40u);
+    EXPECT_EQ(ActiveStreamingSources(storage), 0u);
+    EXPECT_TRUE(
+        ReserveStreamingArena(storage, storage.config_.local_buffer_size));
+}
+
+TEST_F(FileStorageTest, OwnerStreamingPreflightsAllSourcesAndChecksum) {
+    FileStorage storage(OwnerConfig(data_path), nullptr, "local");
+    std::string value(12000, 's');
+    PrepareStreamingObject(
+        storage, TenantId("owner-tenant").MakeScopedKey("key"), value);
+    std::array<char, 16> bytes;
+    bytes.fill('z');
+    auto target = std::make_shared<OwnerCopyTarget>(
+        std::vector<Slice>{{bytes.data(), 8}, {bytes.data() + 8, 8}});
+    auto request = OwnerRequest("key", value.size(), 8);
+    auto missing = OwnerRequest("missing", value.size(), 8).objects[0];
+    missing.ranges[0].destinations[0].offset = 8;
+    request.objects.push_back(missing);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto result = storage.ReadOwnerStreaming(request, target, deadline);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_KEY);
+    request.objects.pop_back();
+    request.objects[0].expected_object_checksum = 123;
+    result = storage.ReadOwnerStreaming(request, target, deadline);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::NOT_SUPPORTED);
+    EXPECT_EQ(target->writes.load(), 0u);
+    EXPECT_EQ(std::string(bytes.data(), bytes.size()), std::string(16, 'z'));
+    EXPECT_EQ(ActiveStreamingSources(storage), 0u);
+}
+
+TEST_F(FileStorageTest,
+       OwnerStreamingDeadlineDrainsAcceptedWriteWithoutRefill) {
+    FileStorage storage(OwnerConfig(data_path), nullptr, "local");
+    std::string value(3 * 64 * 1024, 's');
+    PrepareStreamingObject(
+        storage, TenantId("owner-tenant").MakeScopedKey("key"), value);
+    std::vector<char> bytes(value.size(), 'z');
+    auto request = OwnerRequest("key", value.size(), value.size());
+    auto target = std::make_shared<OwnerCopyTarget>(
+        std::vector<Slice>{{bytes.data(), bytes.size()}});
+    std::promise<void> entered, release;
+    auto entry = entered.get_future();
+    target->entered = &entered;
+    target->release = release.get_future().share();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
+    auto work = std::async(std::launch::async, [&] {
+        return storage.ReadOwnerStreaming(request, target, deadline);
+    });
+    const auto ready = entry.wait_for(std::chrono::seconds(2));
+    EXPECT_EQ(ready, std::future_status::ready);
+    EXPECT_EQ(work.wait_for(std::chrono::milliseconds(200)),
+              std::future_status::timeout);
+    EXPECT_EQ(ActiveStreamingSources(storage), 1u);
+    EXPECT_FALSE(
+        ReserveStreamingArena(storage, storage.config_.local_buffer_size));
+    release.set_value();
+    auto result = work.get();
+    ASSERT_TRUE(result) << result.error();
+    EXPECT_TRUE(result->dma_drained);
+    ASSERT_EQ(result->objects.size(), 1u);
+    EXPECT_EQ(result->objects[0].outcome,
+              ssd_offload::AttemptOutcome::kCancelled);
+    EXPECT_EQ(result->objects[0].valid_bytes, 64 * 1024u);
+    EXPECT_EQ(target->writes.load(), 1u);
+    EXPECT_EQ(ssd_offload::ValidateSsdReadResultV1(request, *result),
+              ssd_offload::DestinationError::kOk);
+    EXPECT_EQ(std::memcmp(bytes.data(), value.data(), 64 * 1024), 0);
+    EXPECT_TRUE(std::all_of(bytes.begin() + 64 * 1024, bytes.end(),
+                            [](char c) { return c == 'z'; }));
+    EXPECT_EQ(ActiveStreamingSources(storage), 0u);
+    EXPECT_TRUE(
+        ReserveStreamingArena(storage, storage.config_.local_buffer_size));
+}
+
+TEST_F(FileStorageTest,
+       OwnerStreamingNeverConvertsSourceDrainToDestinationDrain) {
+    FileStorage storage(OwnerConfig(data_path), nullptr, "local");
+    std::string value(12000, 's');
+    PrepareStreamingObject(
+        storage, TenantId("owner-tenant").MakeScopedKey("key"), value);
+    std::array<char, 16> bytes{};
+    auto request = OwnerRequest("key", value.size(), bytes.size());
+    auto target = std::make_shared<OwnerCopyTarget>(
+        std::vector<Slice>{{bytes.data(), bytes.size()}});
+    target->fail = true;
+    target->drained = false;
+    auto result = storage.ReadOwnerStreaming(
+        request, target,
+        std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    ASSERT_TRUE(result) << result.error();
+    EXPECT_FALSE(result->dma_drained);
+    EXPECT_EQ(result->objects[0].outcome, ssd_offload::AttemptOutcome::kFailed);
+    EXPECT_EQ(result->objects[0].valid_bytes, 0u);
+    EXPECT_EQ(ssd_offload::ValidateSsdReadResultV1(request, *result),
+              ssd_offload::DestinationError::kNotDrained);
+    EXPECT_EQ(target->writes.load(), 1u);
+    EXPECT_EQ(ActiveStreamingSources(storage), 0u);
+}
+
+TEST_F(FileStorageTest, OwnerStreamingThroughRealControlRpcAndRequesterLease) {
+    RunOwnerControlRestore(false);
+}
+TEST_F(FileStorageTest, OwnerStreamingThroughRealControlRpcAndTcpWriteTarget) {
+    RunOwnerControlRestore(true);
+}
+
+TEST_F(FileStorageTest, OwnerStreamingThroughOwnedRequesterAndTcpWriteTarget) {
+    using namespace ssd_offload;
+    auto engine = [] {
+        auto result = std::make_shared<TransferEngine>(false);
+        if (result->init("P2PHANDSHAKE", "127.0.0.1:0", "127.0.0.1", 0) != 0 ||
+            !result->installTransport("tcp", nullptr))
+            return std::shared_ptr<TransferEngine>{};
+        return result;
+    };
+    auto source_engine = engine(), destination_engine = engine();
+    ASSERT_TRUE(source_engine);
+    ASSERT_TRUE(destination_engine);
+    if (source_engine->isUsingTent()) GTEST_SKIP() << "Requires classic TE TCP";
+    auto storage =
+        std::make_shared<FileStorage>(OwnerConfig(data_path), nullptr, "local");
+    auto arena_registration = RegisterStreamingArena(storage, source_engine);
+    ASSERT_TRUE(arena_registration);
+    std::string value(3 * 1024 * 1024 + 123, 's');
+    for (size_t i = 0; i < value.size(); ++i) value[i] = char(i % 251);
+    PrepareStreamingObject(
+        *storage, TenantId("owner-tenant").MakeScopedKey("key"), value);
+    const PeerIdentity requester{1, 2, 3}, owner{4, 5, 6};
+    auto ledger = std::make_shared<SsdOwnerRequestLedger>(owner);
+    std::shared_ptr<SsdOwnerReadWorker> worker;
+    SsdControlRpcEndpoint owner_endpoint(
+        {}, ledger,
+        [&worker](const auto& request, const auto& reference, auto operation) {
+            EXPECT_TRUE(worker);
+            if (worker)
+                EXPECT_EQ(worker->Run(request, reference, std::move(operation)),
+                          DestinationError::kOk);
+        });
+    SsdControlRpcServer owner_server(1, 0, "127.0.0.1");
+    owner_server.register_handler<&SsdControlRpcEndpoint::Call>(
+        &owner_endpoint);
+    owner_server.async_start();
+    ASSERT_FALSE(owner_server.get_errc());
+    const auto data_endpoint = destination_engine->getLocalIpAndPort();
+    auto transport = std::make_shared<TransferEngineDestinationRegistration>(
+        destination_engine);
+    SsdPushPeerInfo owner_peer{owner,
+                               "owner-tenant",
+                               "owner-legacy:9000",
+                               "127.0.0.1",
+                               owner_server.port(),
+                               source_engine->getLocalIpAndPort(),
+                               {1,
+                                owner,
+                                15,
+                                64,
+                                64 * 1024 * 1024,
+                                65536,
+                                64 * 1024 * 1024,
+                                65536,
+                                {"tcp"}}};
+    SsdPushRequester client(requester, "owner-tenant", data_endpoint, transport,
+                            {owner_peer}, MakeSsdRequesterControlCall());
+    SsdControlRpcEndpoint requester_endpoint(client.grants(), {});
+    SsdControlRpcServer requester_server(1, 0, "127.0.0.1");
+    requester_server.register_handler<&SsdControlRpcEndpoint::Call>(
+        &requester_endpoint);
+    requester_server.async_start();
+    ASSERT_FALSE(requester_server.get_errc());
+    SsdOwnerRequesterPeer requester_peer{
+        requester, "owner-tenant", data_endpoint,
+        [port = requester_server.port()](const auto& reference,
+                                         const auto& request, auto timeout) {
+            auto resolved = CallSsdControlRpc(
+                "127.0.0.1", port,
+                {SsdControlCommand::kResolve, reference, request}, timeout);
+            return resolved.error == DestinationError::kOk && resolved.reply
+                       ? SsdGrantResolution{resolved.reply->error,
+                                            std::move(
+                                                resolved.reply->destinations)}
+                       : SsdGrantResolution{DestinationError::kTransportError,
+                                            {}};
+        }};
+    worker = std::make_shared<SsdOwnerReadWorker>(
+        owner, std::vector<SsdOwnerRequesterPeer>{requester_peer},
+        [source_engine](auto views) {
+            return PrepareSsdTcpWriteTarget(source_engine, std::move(views))
+                .target;
+        },
+        MakeFileStorageOwnerReader(storage));
+    constexpr size_t offset = 12345, length = 150000;
+    auto started = client.Start("owner-legacy:9000",
+                                {{"key", value.size(), 0, value.size()},
+                                 {"key", value.size(), offset, length}},
+                                std::chrono::seconds(5));
+    ASSERT_EQ(started.error, DestinationError::kOk);
+    ASSERT_TRUE(started.may_have_submitted);
+    ASSERT_TRUE(started.read);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!started.read->data(0) &&
+           std::chrono::steady_clock::now() < deadline) {
+        ASSERT_EQ(started.read->Poll(std::chrono::seconds(1)),
+                  DestinationError::kOk);
+        if (!started.read->data(0))
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    auto full = started.read->data(0), range = started.read->data(1);
+    ASSERT_TRUE(full);
+    ASSERT_TRUE(range);
+    EXPECT_EQ(full->size(), value.size());
+    EXPECT_EQ(std::memcmp(full->data(), value.data(), value.size()), 0);
+    EXPECT_EQ(range->size(), length);
+    EXPECT_EQ(std::memcmp(range->data(), value.data() + offset, length), 0);
+    full.reset();
+    range.reset();
+    EXPECT_EQ(started.read->Release(std::chrono::seconds(1)),
+              DestinationError::kOk);
+    EXPECT_EQ(client.stats().owned_bytes, 0u);
+    EXPECT_EQ(client.stats().pinned_regions, 0u);
+    EXPECT_EQ(ledger->stats().records, 0u);
+    owner_server.stop();
+    requester_server.stop();
+    EXPECT_EQ(client.Close(), DestinationError::kOk);
+}
+
+void FileStorageTest::RunOwnerControlRestore(bool tcp) {
+    using namespace ssd_offload;
+    std::weak_ptr<FileStorage> lifetime;
+    {
+        auto create_engine = [] {
+            auto engine = std::make_shared<TransferEngine>(false);
+            if (engine->init("P2PHANDSHAKE", "127.0.0.1:0", "127.0.0.1", 0) !=
+                    0 ||
+                !engine->installTransport("tcp", nullptr))
+                return std::shared_ptr<TransferEngine>{};
+            return engine;
+        };
+        auto source_engine = tcp ? create_engine() : nullptr;
+        auto destination_engine = tcp ? create_engine() : nullptr;
+        if (tcp) {
+            ASSERT_TRUE(source_engine);
+            ASSERT_TRUE(destination_engine);
+            if (source_engine->isUsingTent())
+                GTEST_SKIP() << "Requires classic TE TCP";
+        }
+        auto storage = std::make_shared<FileStorage>(OwnerConfig(data_path),
+                                                     nullptr, "local");
+        lifetime = storage;
+        auto arena_registration =
+            tcp ? RegisterStreamingArena(storage, source_engine) : nullptr;
+        if (tcp) ASSERT_TRUE(arena_registration);
+        std::string value(3 * 1024 * 1024 + 123, 's');
+        for (size_t i = 0; i < value.size(); ++i) value[i] = char(i % 251);
+        PrepareStreamingObject(
+            *storage, TenantId("owner-tenant").MakeScopedKey("key"), value);
+        const PeerIdentity requester{1, 2, 3}, owner{4, 5, 6};
+        auto buffer =
+            std::make_shared<std::vector<char>>(value.size() + 64, 'z');
+        const auto base = reinterpret_cast<uint64_t>(buffer->data());
+        std::shared_ptr<DestinationRegistrationTransport> transport;
+        if (tcp)
+            transport = std::make_shared<TransferEngineDestinationRegistration>(
+                destination_engine);
+        else
+            transport = std::make_shared<OwnerTestRegistration>();
+        const std::string data_endpoint =
+            tcp ? destination_engine->getLocalIpAndPort() : "requester-te";
+        auto registration = std::make_shared<DestinationRegistration>(
+            requester, data_endpoint, transport);
+        auto region = registration->Register(
+            {base + 32, value.size(), base, buffer->size()}, "cpu:0", buffer);
+        ASSERT_EQ(region.error, DestinationError::kOk);
+        auto grants =
+            std::make_shared<SsdRequesterGrants>(requester, registration);
+        auto request = OwnerRequest("key", value.size(), value.size());
+        request.objects[0].ranges[0].destinations[0].region = region.region;
+        auto prepared = grants->Prepare(request);
+        ASSERT_EQ(prepared.error, DestinationError::kOk);
+        SsdControlRpcEndpoint requester_endpoint(grants, {});
+        SsdControlRpcServer requester_server(1, 0, "127.0.0.1");
+        requester_server.register_handler<&SsdControlRpcEndpoint::Call>(
+            &requester_endpoint);
+        requester_server.async_start();
+        ASSERT_FALSE(requester_server.get_errc());
+        SsdOwnerRequesterPeer peer{
+            requester, "owner-tenant", data_endpoint,
+            [port = requester_server.port()](const auto& ref, const auto& req,
+                                             auto timeout) {
+                auto call = CallSsdControlRpc(
+                    "127.0.0.1", port, {SsdControlCommand::kResolve, ref, req},
+                    timeout);
+                if (call.transport_error ||
+                    call.error != DestinationError::kOk || !call.reply)
+                    return SsdGrantResolution{DestinationError::kTransportError,
+                                              {}};
+                return SsdGrantResolution{call.reply->error,
+                                          std::move(call.reply->destinations)};
+            }};
+        std::atomic<size_t> readers{0};
+        auto reader = MakeFileStorageOwnerReader(storage);
+        auto worker = std::make_shared<SsdOwnerReadWorker>(
+            owner, std::vector<SsdOwnerRequesterPeer>{std::move(peer)},
+            [tcp, source_engine](
+                auto views) -> std::shared_ptr<SourceDrainedWriteTarget> {
+                if (tcp) {
+                    auto prepared = PrepareSsdTcpWriteTarget(source_engine,
+                                                             std::move(views));
+                    EXPECT_EQ(prepared.error, DestinationError::kOk);
+                    return prepared.target;
+                }
+                std::vector<Slice> slices;
+                for (const auto& view : views)
+                    slices.push_back({reinterpret_cast<void*>(view.address),
+                                      size_t(view.length)});
+                return std::make_shared<OwnerCopyTarget>(std::move(slices));
+            },
+            [reader = std::move(reader), &readers](const auto& req, auto target,
+                                                   auto deadline) {
+                ++readers;
+                return reader(req, std::move(target), deadline);
+            });
+        storage.reset();  // Adapter retains the real backend and staging arena.
+        EXPECT_FALSE(lifetime.expired());
+        auto ledger = std::make_shared<SsdOwnerRequestLedger>(owner);
+        SsdControlRpcEndpoint owner_endpoint(
+            {}, ledger, [worker](const auto& req, const auto& ref, auto op) {
+                EXPECT_EQ(worker->Run(req, ref, std::move(op)),
+                          DestinationError::kOk);
+            });
+        SsdControlRpcServer owner_server(1, 0, "127.0.0.1");
+        owner_server.register_handler<&SsdControlRpcEndpoint::Call>(
+            &owner_endpoint);
+        owner_server.async_start();
+        ASSERT_FALSE(owner_server.get_errc());
+        auto call = [&](SsdControlCommand command, bool with_request = false) {
+            return CallSsdControlRpc(
+                "127.0.0.1", owner_server.port(),
+                {command, prepared.reference,
+                 with_request ? std::optional(request) : std::nullopt},
+                std::chrono::seconds(2));
+        };
+        auto submitted = call(SsdControlCommand::kSubmit, true);
+        ASSERT_FALSE(submitted.transport_error);
+        ASSERT_TRUE(submitted.reply);
+        EXPECT_EQ(submitted.reply->error, DestinationError::kOk);
+        auto duplicate = call(SsdControlCommand::kSubmit, true);
+        ASSERT_TRUE(duplicate.reply);
+        EXPECT_EQ(duplicate.reply->error, DestinationError::kDuplicate);
+        std::optional<SsdReadResultV1> terminal;
+        const auto until =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < until) {
+            auto query = call(SsdControlCommand::kQuery);
+            ASSERT_FALSE(query.transport_error);
+            ASSERT_TRUE(query.reply);
+            ASSERT_TRUE(query.reply->snapshot);
+            if (query.reply->snapshot->result) {
+                terminal = query.reply->snapshot->result;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        ASSERT_TRUE(terminal);
+        EXPECT_EQ(terminal->objects[0].outcome, AttemptOutcome::kSucceeded);
+        EXPECT_EQ(terminal->objects[0].valid_bytes, value.size());
+        EXPECT_EQ(readers.load(), 1u);
+        EXPECT_EQ(std::memcmp(buffer->data() + 32, value.data(), value.size()),
+                  0);
+        EXPECT_TRUE(std::all_of(buffer->begin(), buffer->begin() + 32,
+                                [](char c) { return c == 'z'; }));
+        EXPECT_TRUE(std::all_of(buffer->end() - 32, buffer->end(),
+                                [](char c) { return c == 'z'; }));
+        EXPECT_EQ(grants->Complete(prepared.reference, *terminal),
+                  DestinationError::kOk);
+        EXPECT_TRUE(grants->Inspect(prepared.reference).publishable);
+        auto forgotten = call(SsdControlCommand::kForget);
+        ASSERT_TRUE(forgotten.reply);
+        EXPECT_EQ(forgotten.reply->error, DestinationError::kOk);
+        EXPECT_EQ(grants->Forget(owner, request.attempt.request_id),
+                  DestinationError::kOk);
+        EXPECT_EQ(registration->Revoke(region.region), DestinationError::kOk);
+        owner_server.stop();
+        requester_server.stop();
+    }
+    EXPECT_TRUE(lifetime.expired());
+}
+
+TEST_F(FileStorageTest, LocalStreamingRangeAndInvalidRange) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    config.streaming_read.enabled = true;
+    config.use_uring =
+        std::getenv("MOONCAKE_SSD_TEST_URING") &&
+        std::string(std::getenv("MOONCAKE_SSD_TEST_URING")) == "1";
+    FileStorage storage(config, nullptr, "local");
+    std::string value(12000, 'x');
+    value.replace(300, 5, "hello");
+    PrepareStreamingObject(storage, "range-key", value);
+    std::array<char, 5> destination{};
+    ASSERT_TRUE(storage.ReadLocalStreaming(
+        {{"range-key",
+          value.size(),
+          300,
+          {{destination.data(), destination.size()}}}}));
+    EXPECT_EQ(std::string(destination.data(), destination.size()), "hello");
+    destination.fill('z');
+    auto invalid = storage.ReadLocalStreaming(
+        {{"range-key",
+          value.size(),
+          value.size(),
+          {{destination.data(), destination.size()}}}});
+    ASSERT_FALSE(invalid);
+    EXPECT_EQ(invalid.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(std::string(destination.data(), destination.size()), "zzzzz");
+}
+
+TEST_F(FileStorageTest, LocalStreamingRemainsOptIn) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    FileStorage storage(config, nullptr, "local");
+    EXPECT_FALSE(storage.SupportsLocalStreamingRead());
+    auto result = storage.ReadLocalStreaming({});
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::NOT_SUPPORTED);
+}
+
+TEST_F(FileStorageTest, LocalStreamingPreflightsBatchAndRejectsOverlap) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    config.streaming_read.enabled = true;
+    FileStorage storage(config, nullptr, "local");
+    std::string value(12000, 's');
+    PrepareStreamingObject(storage, "valid-key", value);
+    std::array<char, 16> destination;
+    destination.fill('z');
+    auto bad_key = storage.ReadLocalStreaming(
+        {{"valid-key", value.size(), 0, {{destination.data(), 8}}},
+         {"missing-key", value.size(), 0, {{destination.data() + 8, 8}}}});
+    ASSERT_FALSE(bad_key);
+    EXPECT_EQ(bad_key.error(), ErrorCode::INVALID_KEY);
+    EXPECT_EQ(std::string(destination.data(), 16), std::string(16, 'z'));
+    auto overlap = storage.ReadLocalStreaming(
+        {{"valid-key", value.size(), 0, {{destination.data(), 8}}},
+         {"valid-key", value.size(), 8, {{destination.data() + 4, 8}}}});
+    ASSERT_FALSE(overlap);
+    EXPECT_EQ(overlap.error(), ErrorCode::INVALID_PARAMS);
+    auto null = storage.ReadLocalStreaming(
+        {{"valid-key", value.size(), 0, {{nullptr, 1}}}});
+    ASSERT_FALSE(null);
+    EXPECT_EQ(null.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_TRUE(storage.ReadLocalStreaming({}));
+}
+
+TEST_F(FileStorageTest, LocalStreamingBoundsOpenSourcesBeforeWriting) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    config.streaming_read.enabled = true;
+    config.streaming_read.max_outstanding = 8;
+    FileStorage storage(config, nullptr, "local");
+    std::string value(12000, 's');
+    PrepareStreamingObject(storage, "bounded-key", value);
+    std::array<char, 9> destination;
+    destination.fill('z');
+    std::vector<FileStorage::LocalReadRequest> requests;
+    for (size_t i = 0; i < destination.size(); ++i)
+        requests.push_back(
+            {"bounded-key", value.size(), i, {{destination.data() + i, 1}}});
+    auto rejected = storage.ReadLocalStreaming(requests);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(std::string(destination.data(), 9), std::string(9, 'z'));
+    requests.pop_back();
+    EXPECT_TRUE(storage.ReadLocalStreaming(requests));
+}
+
+TEST_F(FileStorageTest,
+       LocalStreamingReleasesPartialArenaReservationOnFailure) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    config.streaming_read.enabled = true;
+    FileStorage storage(config, nullptr, "local");
+    std::string value(6 * 1024 * 1024, 's');
+    PrepareStreamingObject(storage, "arena-key", value);
+    std::vector<char> destination(value.size(), 'z');
+    auto held = ReserveStreamingArena(storage, 6 * 1024 * 1024);
+    ASSERT_TRUE(held);
+    const std::vector<FileStorage::LocalReadRequest> requests{
+        {"arena-key",
+         value.size(),
+         0,
+         {{destination.data(), destination.size()}}}};
+    auto failed = storage.ReadLocalStreaming(requests);
+    ASSERT_FALSE(failed);
+    EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_TRUE(std::all_of(destination.begin(), destination.end(),
+                            [](char c) { return c == 'z'; }));
+    held.reset();
+    // Any leaked partial reservation would prevent allocating the full arena.
+    auto whole_arena = ReserveStreamingArena(storage, config.local_buffer_size);
+    ASSERT_TRUE(whole_arena);
+    whole_arena.reset();
+    ASSERT_TRUE(storage.ReadLocalStreaming(requests));
+    EXPECT_EQ(std::memcmp(destination.data(), value.data(), value.size()), 0);
+}
+
+TEST_F(FileStorageTest, LocalStreamingSharesSourceCreditsAcrossCallers) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    config.streaming_read.enabled = true;
+    config.streaming_read.slots = 1;
+    config.streaming_read.read_workers = 1;
+    config.streaming_read.max_outstanding = 2;
+    FileStorage storage(config, nullptr, "local");
+    std::string value(12000, 's');
+    PrepareStreamingObject(storage, "concurrent-key", value);
+    std::array<char, 3> destination{};
+    std::promise<void> started, release;
+    auto released = release.get_future().share();
+    ASSERT_TRUE(SubmitStreamingReadTask(storage, [&] {
+        started.set_value();
+        released.wait();
+    }));
+    started.get_future().wait();
+    auto first = std::async(std::launch::async, [&] {
+        return storage.ReadLocalStreaming(
+            {{"concurrent-key", value.size(), 0, {{destination.data(), 1}}}});
+    });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!ActiveStreamingSources(storage) &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    EXPECT_EQ(ActiveStreamingSources(storage), 1u);
+    const std::vector<FileStorage::LocalReadRequest> second{
+        {"concurrent-key", value.size(), 1, {{destination.data() + 1, 1}}},
+        {"concurrent-key", value.size(), 2, {{destination.data() + 2, 1}}}};
+    auto concurrent = std::async(
+        std::launch::async, [&] { return storage.ReadLocalStreaming(second); });
+    EXPECT_EQ(concurrent.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    // Unblock accepted I/O even if a broken admission path failed assertions.
+    release.set_value();
+    auto rejected = concurrent.get();
+    EXPECT_FALSE(rejected);
+    if (!rejected) EXPECT_EQ(rejected.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_TRUE(first.get());
+    EXPECT_TRUE(storage.ReadLocalStreaming(second));
+    EXPECT_EQ(std::string(destination.data(), 3), "sss");
+}
+
+}  // namespace mooncake
+
+namespace mooncake {
+TEST_F(FileStorageTest,
+       OwnerStreamingUsesNativeUringInsteadOfSynchronousReadAt) {
+    auto config = OwnerConfig(data_path);
+    config.streaming_read.use_uring = true;
+    FileStorage storage(config, nullptr, "local");
+    InstallNativeOnlyBackend(storage, config);
+    std::string value(150000, 'u');
+    PrepareStreamingObject(
+        storage, TenantId("owner-tenant").MakeScopedKey("native-key"), value);
+    std::vector<char> destination(value.size(), '?');
+    auto target = std::make_shared<OwnerCopyTarget>(
+        std::vector<Slice>{{destination.data(), destination.size()}});
+    auto result = storage.ReadOwnerStreaming(
+        OwnerRequest("native-key", value.size(), value.size()), target,
+        std::chrono::steady_clock::now() + std::chrono::seconds(2));
+#ifdef USE_URING
+    ASSERT_TRUE(result) << (result ? "success" : toString(result.error()));
+    EXPECT_EQ(result->objects[0].outcome,
+              ssd_offload::AttemptOutcome::kSucceeded);
+    EXPECT_EQ(destination, std::vector<char>(value.begin(), value.end()));
+#else
+    EXPECT_FALSE(result);
+#endif
+}
+
+TEST_F(FileStorageTest, OwnerStreamingNativeBatchSwitchesSourcesAndRanges) {
+    auto config = OwnerConfig(data_path);
+    config.streaming_read.use_uring = true;
+    config.streaming_read.slots = 2;
+    FileStorage storage(config, nullptr, "local");
+    InstallNativeOnlyBackend(storage, config);
+    std::string first(150000, 'a'), second(160007, 'b');
+    for (size_t i = 0; i < first.size(); ++i)
+        first[i] = char((i * 37 + 5) % 251);
+    for (size_t i = 0; i < second.size(); ++i)
+        second[i] = char((i * 53 + 11) % 251);
+    PrepareStreamingBatch(storage,
+                          {{TenantId("owner-tenant").MakeScopedKey("first"),
+                            {{first.data(), first.size()}}},
+                           {TenantId("owner-tenant").MakeScopedKey("second"),
+                            {{second.data(), second.size()}}}});
+    constexpr size_t guard = 32, offset = 61, length = 70001;
+    std::vector<char> destination(guard + first.size() + guard + length + guard,
+                                  '?');
+    auto request = OwnerRequest("first", first.size(), first.size());
+    request.objects[0].ranges[0].destinations[0].offset = guard;
+    auto next =
+        OwnerRequest("second", second.size(), length, offset).objects[0];
+    const auto next_destination = guard + first.size() + guard;
+    auto target = std::make_shared<OwnerCopyTarget>(
+        std::vector<Slice>{{destination.data() + guard, first.size()},
+                           {destination.data() + next_destination, length}});
+    next.ranges[0].destinations[0].offset = next_destination;
+    request.objects.push_back(std::move(next));
+    auto result = storage.ReadOwnerStreaming(
+        request, target,
+        std::chrono::steady_clock::now() + std::chrono::seconds(2));
+#ifdef USE_URING
+    ASSERT_TRUE(result) << (result ? "success" : toString(result.error()));
+    ASSERT_EQ(result->objects.size(), 2u);
+    for (const auto& object : result->objects)
+        EXPECT_EQ(object.outcome, ssd_offload::AttemptOutcome::kSucceeded);
+    EXPECT_EQ(std::string(destination.data() + guard, first.size()), first);
+    EXPECT_EQ(std::string(destination.data() + next_destination, length),
+              second.substr(offset, length));
+    for (size_t i = 0; i < destination.size(); ++i) {
+        if (i < guard || (i >= guard + first.size() && i < next_destination) ||
+            i >= next_destination + length) {
+            EXPECT_EQ(destination[i], '?');
+        }
+    }
+    EXPECT_TRUE(result->dma_drained);
+#else
+    EXPECT_FALSE(result);
+#endif
+}
 }  // namespace mooncake

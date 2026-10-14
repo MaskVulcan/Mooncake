@@ -1,5 +1,11 @@
 #pragma once
 
+#include <algorithm>
+#include <cstdlib>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <vector>
 #include <string>
 #include <ylt/util/tl/expected.hpp>
 

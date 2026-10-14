@@ -22,6 +22,8 @@
 #include "mutex.h"
 #include "offset_allocator/offset_allocator.h"
 #include "types.h"
+#include "ssd_read_source.h"
+#include "ssd_streaming_config.h"
 
 namespace mooncake {
 struct FileRecord {
@@ -242,6 +244,9 @@ struct FileStorageConfig {
     double disk_eviction_high_watermark_ratio = 0.90;
     double disk_eviction_low_watermark_ratio = 0.80;
 
+    // Append optional fields to preserve legacy aggregate initialization.
+    ssd_offload::StreamingReadConfig streaming_read;
+
     // Validates the configuration for correctness and consistency
     bool Validate() const;
 
@@ -312,6 +317,13 @@ class StorageBackendInterface {
                             double /* low_watermark_ratio */,
                             EvictionHandler /* eviction_handler */ = nullptr) {
         return std::vector<std::string>{};
+    }
+
+    virtual bool SupportsStreamingRead() const { return false; }
+    // Pins the immutable object location and file while the source is live.
+    virtual tl::expected<std::shared_ptr<ssd_offload::ReadSource>, ErrorCode>
+    AcquireReadSource(const std::string&, uint64_t) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 
     FileStorageConfig file_storage_config_;
@@ -796,6 +808,10 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<void, ErrorCode> GetBucketKeys(
         int64_t bucket_id, std::vector<std::string>& bucket_keys);
+
+    bool SupportsStreamingRead() const override { return true; }
+    tl::expected<std::shared_ptr<ssd_offload::ReadSource>, ErrorCode>
+    AcquireReadSource(const std::string& key, uint64_t expected_size) override;
 
     /**
      * @brief Initializes the bucket storage backend.

@@ -1702,6 +1702,26 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_CorruptedHeader) {
     EXPECT_EQ(load_res.error(), ErrorCode::FILE_READ_FAIL);
 }
 
+TEST_F(StorageBackendTest, StreamingReadSourceOutlivesBackend) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    auto backend =
+        std::make_unique<BucketStorageBackend>(config, BucketBackendConfig{});
+    ASSERT_TRUE(backend->Init());
+    std::string value(12000, 's');
+    ASSERT_TRUE(backend->BatchOffload(
+        {{"owned-source", {{value.data(), value.size()}}}},
+        [](const auto&, auto&) { return ErrorCode::OK; }));
+    auto source = backend->AcquireReadSource("owned-source", value.size());
+    ASSERT_TRUE(source);
+    backend.reset();
+    std::array<std::byte, 64> buffer{};
+    const auto result =
+        (*source)->ReadAt(buffer, (*source)->info().value_file_offset);
+    EXPECT_EQ(result.error, ssd_offload::Error::kOk);
+    EXPECT_EQ(result.bytes, buffer.size());
+    EXPECT_EQ(std::memcmp(buffer.data(), value.data(), buffer.size()), 0);
+}
 //-----------------------------------------------------------------------------
 
 TEST_F(StorageBackendTest,
@@ -2418,6 +2438,40 @@ TEST_F(StorageBackendTest, BucketEvictionDoesNotReportSkippedDuplicateKeys) {
 
 //-----------------------------------------------------------------------------
 // BucketReadGuard RAII Behavior Tests (Phase 1 - D2)
+
+TEST_F(StorageBackendTest, StreamingReadSourcePinsBucketUntilReleased) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, BucketBackendConfig{});
+    ASSERT_TRUE(backend.Init());
+    std::string value(12000, 's');
+    std::unordered_map<std::string, std::vector<Slice>> objects{
+        {"stream-key", {{value.data(), value.size()}}}};
+    int64_t bucket_id = 0;
+    ASSERT_TRUE(backend.BatchOffload(objects, [&](const auto&, auto& metadata) {
+        bucket_id = metadata[0].bucket_id;
+        return ErrorCode::OK;
+    }));
+    EXPECT_TRUE(backend.SupportsStreamingRead());
+    EXPECT_FALSE(backend.AcquireReadSource("missing", value.size()));
+    EXPECT_FALSE(backend.AcquireReadSource("stream-key", value.size() + 1));
+    auto acquired = backend.AcquireReadSource("stream-key", value.size());
+    ASSERT_TRUE(acquired);
+    auto source = std::move(acquired.value());
+    EXPECT_EQ(source->info().object_bytes, value.size());
+    std::array<std::byte, 64> buffer{};
+    auto result = source->ReadAt(buffer, source->info().value_file_offset + 23);
+    ASSERT_EQ(result.error, ssd_offload::Error::kOk);
+    EXPECT_EQ(result.bytes, buffer.size());
+    EXPECT_EQ(std::memcmp(buffer.data(), value.data() + 23, buffer.size()), 0);
+    auto deleting = std::async(std::launch::async,
+                               [&] { return backend.DeleteBucket(bucket_id); });
+    EXPECT_EQ(deleting.wait_for(std::chrono::milliseconds(30)),
+              std::future_status::timeout);
+    source.reset();
+    EXPECT_TRUE(deleting.get());
+    EXPECT_FALSE(backend.AcquireReadSource("stream-key", value.size()));
+}
 //-----------------------------------------------------------------------------
 
 TEST_F(StorageBackendTest,
