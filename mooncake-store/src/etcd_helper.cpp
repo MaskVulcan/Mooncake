@@ -5,8 +5,26 @@
 #endif
 
 #include <glog/logging.h>
+#include <limits>
+#include <string_view>
 
 namespace mooncake {
+namespace {
+
+bool IsFiniteRange(const char* start_key, size_t start_key_size,
+                   const char* end_key, size_t end_key_size) {
+    constexpr size_t max_size = std::numeric_limits<int>::max();
+    if (start_key == nullptr || end_key == nullptr || start_key_size == 0 ||
+        end_key_size == 0 || start_key_size > max_size ||
+        end_key_size > max_size) {
+        return false;
+    }
+    const std::string_view begin(start_key, start_key_size);
+    const std::string_view end(end_key, end_key_size);
+    return end != std::string_view("\0", 1) && begin <= end;
+}
+
+}  // namespace
 
 std::string EtcdHelper::connected_endpoints_ = "";
 std::mutex EtcdHelper::etcd_mutex_;
@@ -441,6 +459,36 @@ ErrorCode EtcdHelper::GetRangeAsJson(const char* start_key,
     return ErrorCode::OK;
 }
 
+ErrorCode EtcdHelper::GetRangeKeysAsJson(const char* start_key,
+                                         size_t start_key_size,
+                                         const char* end_key,
+                                         size_t end_key_size, size_t limit,
+                                         std::string& json) {
+    json.clear();
+    if (!IsFiniteRange(start_key, start_key_size, end_key, end_key_size) ||
+        limit == 0 ||
+        limit > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    char* err_msg = nullptr;
+    char* json_ptr = nullptr;
+    int json_size = 0;
+    const int ret = EtcdStoreGetRangeKeysAsJsonWrapper(
+        const_cast<char*>(start_key), static_cast<int>(start_key_size),
+        const_cast<char*>(end_key), static_cast<int>(end_key_size),
+        static_cast<int>(limit), &json_ptr, &json_size, &err_msg);
+    if (ret != 0 || json_ptr == nullptr || json_size < 0) {
+        LOG(ERROR) << "Failed to read etcd range keys: "
+                   << (err_msg == nullptr ? "invalid response" : err_msg);
+        free(err_msg);
+        free(json_ptr);
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    json.assign(json_ptr, static_cast<size_t>(json_size));
+    free(json_ptr);
+    return ErrorCode::OK;
+}
+
 ErrorCode EtcdHelper::GetFirstKeyWithPrefix(const char* prefix,
                                             const size_t prefix_size,
                                             std::string& first_key) {
@@ -504,6 +552,31 @@ ErrorCode EtcdHelper::DeleteRange(const char* start_key,
         free(err_msg);
         return ErrorCode::ETCD_OPERATION_ERROR;
     }
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdHelper::DeleteRangeCounted(const char* start_key,
+                                         size_t start_key_size,
+                                         const char* end_key,
+                                         size_t end_key_size,
+                                         uint64_t& deleted) {
+    deleted = 0;
+    if (!IsFiniteRange(start_key, start_key_size, end_key, end_key_size)) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    char* err_msg = nullptr;
+    long long go_deleted = 0;
+    const int ret = EtcdStoreDeleteRangeCountedWrapper(
+        const_cast<char*>(start_key), static_cast<int>(start_key_size),
+        const_cast<char*>(end_key), static_cast<int>(end_key_size), &go_deleted,
+        &err_msg);
+    if (ret != 0 || go_deleted < 0) {
+        LOG(ERROR) << "Failed to delete etcd range: "
+                   << (err_msg == nullptr ? "invalid delete count" : err_msg);
+        free(err_msg);
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    deleted = static_cast<uint64_t>(go_deleted);
     return ErrorCode::OK;
 }
 
@@ -721,6 +794,19 @@ ErrorCode EtcdHelper::GetRangeAsJson(const char* start_key,
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
+ErrorCode EtcdHelper::GetRangeKeysAsJson(const char* start_key,
+                                         size_t start_key_size,
+                                         const char* end_key,
+                                         size_t end_key_size, size_t limit,
+                                         std::string& json) {
+    json.clear();
+    if (!IsFiniteRange(start_key, start_key_size, end_key, end_key_size) ||
+        limit == 0 ||
+        limit > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
 ErrorCode EtcdHelper::GetFirstKeyWithPrefix(const char* prefix,
                                             const size_t prefix_size,
                                             std::string& first_key) {
@@ -750,6 +836,17 @@ ErrorCode EtcdHelper::DeleteRange(const char* start_key,
     (void)end_key;
     (void)end_key_size;
     LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+ErrorCode EtcdHelper::DeleteRangeCounted(const char* start_key,
+                                         size_t start_key_size,
+                                         const char* end_key,
+                                         size_t end_key_size,
+                                         uint64_t& deleted) {
+    deleted = 0;
+    if (!IsFiniteRange(start_key, start_key_size, end_key, end_key_size)) {
+        return ErrorCode::INVALID_PARAMS;
+    }
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
 

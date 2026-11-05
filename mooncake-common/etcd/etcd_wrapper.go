@@ -43,6 +43,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 
 	rpctypes "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
@@ -1273,6 +1274,78 @@ func EtcdStoreGetRangeAsJsonWrapper(startKey *C.char, startKeySize C.int, endKey
 	return 0
 }
 
+func validateFiniteRange(start, end string) error {
+	if start == "" || end == "" || end == "\x00" || start > end {
+		return errors.New("range must have nonempty finite ordered bounds")
+	}
+	return nil
+}
+
+// rangeKeysJSON deliberately does not use Range's full-value response. Cleanup
+// must not fetch oplog bodies merely to select the next delete boundary.
+func rangeKeysJSON(ctx context.Context, kv clientv3.KV, start, end string, limit int64) ([]byte, error) {
+	if err := validateFiniteRange(start, end); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 1<<31-1 {
+		return nil, errors.New("keys-only range requires a positive int32 limit")
+	}
+	keys := make([]string, 0)
+	if start == end {
+		return json.Marshal(keys)
+	}
+	resp, err := kv.Get(ctx, start, clientv3.WithRange(end), clientv3.WithKeysOnly(),
+		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend), clientv3.WithLimit(limit))
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil || int64(len(resp.Kvs)) > limit {
+		return nil, errors.New("invalid keys-only range response")
+	}
+	for _, item := range resp.Kvs {
+		if item == nil || !utf8.Valid(item.Key) {
+			// JSON strings would otherwise silently replace invalid UTF-8 bytes.
+			return nil, errors.New("range key cannot be represented losslessly as JSON")
+		}
+		key := string(item.Key)
+		if key < start || key >= end || (len(keys) > 0 && key <= keys[len(keys)-1]) {
+			return nil, errors.New("keys-only response violates range ordering")
+		}
+		keys = append(keys, key)
+	}
+	return json.Marshal(keys)
+}
+
+//export EtcdStoreGetRangeKeysAsJsonWrapper
+func EtcdStoreGetRangeKeysAsJsonWrapper(startKey *C.char, startKeySize C.int, endKey *C.char, endKeySize C.int, limit C.int, outJson **C.char, outJsonSize *C.int, errMsg **C.char) int {
+	*outJson = nil
+	*outJsonSize = 0
+	if startKey == nil || endKey == nil || startKeySize <= 0 || endKeySize <= 0 {
+		*errMsg = C.CString("invalid range key buffers")
+		return -1
+	}
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	b, err := rangeKeysJSON(ctx, cli, C.GoStringN(startKey, startKeySize),
+		C.GoStringN(endKey, endKeySize), int64(limit))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	if len(b) > 1<<31-1 {
+		*errMsg = C.CString("keys-only response exceeds C buffer size")
+		return -1
+	}
+	*outJson = C.CString(string(b))
+	*outJsonSize = C.int(len(b))
+	return 0
+}
+
 //export EtcdStoreGetFirstKeyWithPrefixWrapper
 func EtcdStoreGetFirstKeyWithPrefixWrapper(prefix *C.char, prefixSize C.int, firstKey **C.char, firstKeySize *C.int, errMsg **C.char) int {
 	cli := getStoreClient()
@@ -1345,6 +1418,47 @@ func EtcdStoreDeleteRangeWrapper(startKey *C.char, startKeySize C.int, endKey *C
 		*errMsg = C.CString(err.Error())
 		return -1
 	}
+	return 0
+}
+
+func deleteRangeCounted(ctx context.Context, kv clientv3.KV, start, end string) (int64, error) {
+	if err := validateFiniteRange(start, end); err != nil {
+		return 0, err
+	}
+	if start == end {
+		return 0, nil
+	}
+	resp, err := kv.Delete(ctx, start, clientv3.WithRange(end))
+	if err != nil {
+		return 0, err
+	}
+	if resp == nil || resp.Deleted < 0 {
+		return 0, errors.New("invalid delete count")
+	}
+	return resp.Deleted, nil
+}
+
+//export EtcdStoreDeleteRangeCountedWrapper
+func EtcdStoreDeleteRangeCountedWrapper(startKey *C.char, startKeySize C.int, endKey *C.char, endKeySize C.int, deleted *C.longlong, errMsg **C.char) int {
+	*deleted = 0
+	if startKey == nil || endKey == nil || startKeySize <= 0 || endKeySize <= 0 {
+		*errMsg = C.CString("invalid range key buffers")
+		return -1
+	}
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	count, err := deleteRangeCounted(ctx, cli, C.GoStringN(startKey, startKeySize),
+		C.GoStringN(endKey, endKeySize))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	*deleted = C.longlong(count)
 	return 0
 }
 

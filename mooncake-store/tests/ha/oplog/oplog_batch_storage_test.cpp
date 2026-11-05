@@ -1079,10 +1079,12 @@ TEST(EtcdHaKvBackendDeleteTest, RejectsUnboundedAndReversedRanges) {
 
 #ifdef STORE_USE_ETCD
 TEST(EtcdHaKvBackendDeleteTest, RealEtcdDeleteWhileAppending) {
-    const char* endpoints = std::getenv("MOONCAKE_N10_TEST_ETCD_ENDPOINTS");
+    const char* endpoints = std::getenv("MOONCAKE_TEST_ETCD_ENDPOINTS");
+    if (endpoints == nullptr && std::getenv("CI") != nullptr) {
+        endpoints = "http://127.0.0.1:2379";
+    }
     if (endpoints == nullptr) {
-        GTEST_SKIP()
-            << "Set MOONCAKE_N10_TEST_ETCD_ENDPOINTS for isolated etcd";
+        GTEST_SKIP() << "Set MOONCAKE_TEST_ETCD_ENDPOINTS for isolated etcd";
     }
     ASSERT_EQ(ErrorCode::OK, EtcdHelper::ConnectToEtcdStoreClient(endpoints));
     EtcdHaKvBackend backend;
@@ -1139,4 +1141,123 @@ TEST(EtcdHaKvBackendDeleteTest, RealEtcdDeleteWhileAppending) {
 }
 #endif
 
+namespace {
+
+class LegacyBackend : public HaKvBackend {
+   public:
+    ErrorCode Get(std::string_view, std::string&) override {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    ErrorCode Put(std::string_view, std::string_view) override {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    ErrorCode Range(std::string_view, std::string_view, size_t,
+                    std::vector<KvPair>&) override {
+        ++value_reads;
+        return ErrorCode::OK;
+    }
+    ErrorCode DeleteRange(std::string_view, std::string_view) override {
+        ++uncounted_deletes;
+        return ErrorCode::OK;
+    }
+    bool SupportsTxn() const override { return false; }
+    ErrorCode Txn(const KvTxn&) override { return ErrorCode::INVALID_PARAMS; }
+    int value_reads{0};
+    int uncounted_deletes{0};
+};
+
+TEST(HaKvBackendBoundedCleanupTest, UnsupportedMethodsFailClosed) {
+    LegacyBackend backend;
+    std::vector<std::string> keys{"stale"};
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, backend.RangeKeys("a", "z", 1, keys));
+    EXPECT_TRUE(keys.empty());
+    uint64_t deleted = 99;
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
+              backend.DeleteRangeCounted("a", "z", deleted));
+    EXPECT_EQ(0u, deleted);
+    EXPECT_EQ(0, backend.value_reads);
+    EXPECT_EQ(0, backend.uncounted_deletes);
+}
+
+TEST(HaKvBackendBoundedCleanupTest, RejectsUnboundedAndOverflowingRequests) {
+    EtcdHaKvBackend backend;
+    const std::vector<std::pair<std::string, std::string>> invalid_bounds{
+        {"", "z"}, {"a", ""}, {"a", std::string(1, '\0')}, {"z", "a"}};
+    for (const auto& [begin, end] : invalid_bounds) {
+        std::vector<std::string> keys{"stale"};
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS,
+                  backend.RangeKeys(begin, end, 1, keys));
+        EXPECT_TRUE(keys.empty());
+        uint64_t deleted = 99;
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS,
+                  backend.DeleteRangeCounted(begin, end, deleted));
+        EXPECT_EQ(0u, deleted);
+    }
+    std::vector<std::string> keys;
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, backend.RangeKeys("a", "z", 0, keys));
+    EXPECT_EQ(
+        ErrorCode::INVALID_PARAMS,
+        backend.RangeKeys("a", "z", std::numeric_limits<size_t>::max(), keys));
+    EXPECT_EQ(ErrorCode::OK, backend.RangeKeys("a", "a", 1, keys));
+    EXPECT_TRUE(keys.empty());
+    uint64_t deleted = 99;
+    EXPECT_EQ(ErrorCode::OK, backend.DeleteRangeCounted("a", "a", deleted));
+    EXPECT_EQ(0u, deleted);
+    std::string json = "stale";
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
+              EtcdHelper::GetRangeKeysAsJson(
+                  "a", std::numeric_limits<size_t>::max(), "z", 1, 1, json));
+    EXPECT_TRUE(json.empty());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
+              EtcdHelper::DeleteRangeCounted(
+                  "a", 1, "z", std::numeric_limits<size_t>::max(), deleted));
+    EXPECT_EQ(0u, deleted);
+}
+
+#ifdef STORE_USE_ETCD
+TEST(HaKvBackendBoundedCleanupTest, RealEtcdReturnsKeysAndActualDeleteCount) {
+    const char* endpoints = std::getenv("MOONCAKE_TEST_ETCD_ENDPOINTS");
+    if (endpoints == nullptr && std::getenv("CI") != nullptr) {
+        endpoints = "http://127.0.0.1:2379";
+    }
+    if (endpoints == nullptr) {
+        GTEST_SKIP() << "Set MOONCAKE_TEST_ETCD_ENDPOINTS for isolated etcd";
+    }
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::ConnectToEtcdStoreClient(endpoints));
+    EtcdHaKvBackend backend;
+    const std::string prefix =
+        "bounded-kv-test-" + std::to_string(getpid()) + "/";
+    const auto begin = prefix + "batch/";
+    const auto end = prefix + "batch0";
+    const std::string body(256 * 1024, 'v');
+    for (const auto& suffix : {"001", "003", "009"}) {
+        ASSERT_EQ(ErrorCode::OK, backend.Put(begin + suffix, body));
+    }
+    ASSERT_EQ(ErrorCode::OK, backend.Put(prefix + "control", "protected"));
+    std::vector<std::string> keys;
+    ASSERT_EQ(ErrorCode::OK, backend.RangeKeys(begin, end, 2, keys));
+    EXPECT_EQ((std::vector<std::string>{begin + "001", begin + "003"}), keys);
+    uint64_t deleted = 0;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.DeleteRangeCounted(begin, begin + "004", deleted));
+    EXPECT_EQ(2u, deleted);
+    ASSERT_EQ(ErrorCode::OK,
+              backend.DeleteRangeCounted(begin, begin + "004", deleted));
+    EXPECT_EQ(0u, deleted);
+    ASSERT_EQ(ErrorCode::OK, backend.RangeKeys(begin, end, 2, keys));
+    EXPECT_EQ((std::vector<std::string>{begin + "009"}), keys);
+    std::string value;
+    ASSERT_EQ(ErrorCode::OK, backend.Get(prefix + "control", value));
+    EXPECT_EQ("protected", value);
+    ASSERT_EQ(ErrorCode::OK, backend.DeleteRangeCounted(begin, end, deleted));
+    EXPECT_EQ(1u, deleted);
+    ASSERT_EQ(ErrorCode::OK, backend.RangeKeys(begin, end, 2, keys));
+    EXPECT_TRUE(keys.empty());
+    EXPECT_EQ(ErrorCode::OK,
+              backend.DeleteRange(
+                  prefix, "bounded-kv-test-" + std::to_string(getpid()) + "0"));
+}
+#endif
+
+}  // namespace
 }  // namespace mooncake::test

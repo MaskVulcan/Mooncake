@@ -208,6 +208,14 @@ class EtcdHelper {
                                     std::string& json,
                                     EtcdRevisionId& revision_id);
 
+    // Bounded, ascending, keys-only range. The JSON result is an array of
+    // strings; limit must be positive and fit the Go wrapper's int argument.
+    static ErrorCode GetRangeKeysAsJson(const char* start_key,
+                                        size_t start_key_size,
+                                        const char* end_key,
+                                        size_t end_key_size, size_t limit,
+                                        std::string& json);
+
     /*
      * @brief Get the first key with a given prefix (sorted by key).
      * @param prefix: The prefix to search for.
@@ -242,6 +250,11 @@ class EtcdHelper {
                                  const size_t start_key_size,
                                  const char* end_key,
                                  const size_t end_key_size);
+    // Return the count from etcd's DeleteResponse, only on success.
+    static ErrorCode DeleteRangeCounted(const char* start_key,
+                                        size_t start_key_size,
+                                        const char* end_key,
+                                        size_t end_key_size, uint64_t& deleted);
 
     /*
      * @brief Watch all keys with a given prefix from a specific etcd revision.
