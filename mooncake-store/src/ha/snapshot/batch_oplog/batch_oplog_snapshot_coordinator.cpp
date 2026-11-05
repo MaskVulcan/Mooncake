@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <limits>
 #include <utility>
 
 #include <glog/logging.h>
@@ -103,6 +104,9 @@ void BatchOpLogSnapshotCoordinator::Start() {
     stop_requested_ = false;
     promotion_requested_ = false;
     running_ = true;
+    snapshot_not_before_ =
+        Now() + std::chrono::seconds(config_.snapshot_interval_seconds);
+    next_prune_check_.reset();
     worker_ = std::thread(&BatchOpLogSnapshotCoordinator::SchedulerLoop, this);
 }
 
@@ -144,7 +148,9 @@ BatchOpLogSnapshotCoordinatorStatus BatchOpLogSnapshotCoordinator::GetStatus()
             .promotion_requested = promotion_requested_,
             .attempts = attempts_,
             .last_error = last_error_,
-            .catch_up_target = catch_up_target_};
+            .catch_up_target = catch_up_target_,
+            .prune_pending = prune_pending_,
+            .last_prune_error = last_prune_error_};
 }
 
 bool BatchOpLogSnapshotCoordinator::IsRunning() const {
@@ -265,8 +271,27 @@ void BatchOpLogSnapshotCoordinator::FinishAttempt(ErrorCode error,
     cv_.notify_all();
 }
 
+void BatchOpLogSnapshotCoordinator::SchedulePruneContinuation(bool more_work,
+                                                              ErrorCode error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    prune_pending_ = more_work;
+    last_prune_error_ = error;
+    // Error/busy retries are paced separately from successful partial passes.
+    // Idle checks also discover a floor published before a process restart.
+    const auto interval =
+        std::min<uint64_t>(config_.pruning.batch_interval_ms,
+                           std::numeric_limits<uint32_t>::max());
+    const auto delay = std::chrono::milliseconds(
+        more_work
+            ? std::max<uint64_t>(error == ErrorCode::OK ? 20 : 5000, interval)
+            : 5000);
+    next_prune_check_ = Now() + delay;
+    cv_.notify_all();
+}
+
 ErrorCode BatchOpLogSnapshotCoordinator::RunOnce() {
     try {
+        bool snapshot_due;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (attempt_in_flight_) {
@@ -278,34 +303,111 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunOnce() {
                 HAMetricManager::instance().record_snapshot_skip(Skip::Stopped);
                 return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
             }
-            if (last_attempt_complete_ &&
-                Now() - *last_attempt_complete_ <
-                    std::chrono::seconds(config_.snapshot_interval_seconds)) {
-                HAMetricManager::instance().record_snapshot_skip(
-                    Skip::Interval);
-                return ErrorCode::OK;
-            }
             if (promotion_requested_) {
                 HAMetricManager::instance().record_snapshot_skip(
                     Skip::Promotion);
                 return ErrorCode::OK;
             }
+            const auto now = Now();
+            snapshot_due =
+                (!snapshot_not_before_ || now >= *snapshot_not_before_) &&
+                (!last_attempt_complete_ ||
+                 now - *last_attempt_complete_ >=
+                     std::chrono::seconds(config_.snapshot_interval_seconds));
+            const bool prune_due =
+                !next_prune_check_ || now >= *next_prune_check_;
+            if (!snapshot_due && !prune_due) {
+                HAMetricManager::instance().record_snapshot_skip(
+                    Skip::Interval);
+                return ErrorCode::OK;
+            }
+            // Claim before any I/O: publication and cleanup share the same
+            // per-process exclusion, as well as the cluster maintenance lease.
+            attempt_in_flight_ = true;
         }
         HAMetricManager::instance().record_snapshot_skip(Skip::None);
         HAMetricManager::SnapshotOperationTimer timer(
             HAMetricManager::SnapshotOperation::Schedule);
-        const auto error = RunAttempt();
+        const auto error = snapshot_due ? RunAttempt() : RunPruneAttempt();
+        if (snapshot_due) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (running_) {
+                snapshot_not_before_ =
+                    Now() +
+                    std::chrono::seconds(config_.snapshot_interval_seconds);
+            }
+        }
         timer.error = static_cast<int64_t>(error);
         return error;
     } catch (const std::exception& e) {
         LOG(ERROR) << "Batch snapshot coordinator failed: " << e.what();
-        FinishAttempt(ErrorCode::INTERNAL_ERROR, false);
-        return ErrorCode::INTERNAL_ERROR;
     } catch (...) {
         LOG(ERROR) << "Batch snapshot coordinator failed with unknown error";
-        FinishAttempt(ErrorCode::INTERNAL_ERROR, false);
-        return ErrorCode::INTERNAL_ERROR;
     }
+    SchedulePruneContinuation(true, ErrorCode::INTERNAL_ERROR);
+    FinishAttempt(ErrorCode::INTERNAL_ERROR, false);
+    return ErrorCode::INTERNAL_ERROR;
+}
+
+ErrorCode BatchOpLogSnapshotCoordinator::RunPruneAttempt() {
+    if (config_.snapshot_root.empty() ||
+        !NormalizeAndValidateClusterId(cluster_id_) || cluster_id_.empty() ||
+        config_.pruning.max_batches_per_request == 0 ||
+        config_.pruning.max_batches_per_request >
+            static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        config_.pruning.batch_interval_ms >
+            std::numeric_limits<uint32_t>::max()) {
+        SchedulePruneContinuation(true, ErrorCode::INVALID_PARAMS);
+        FinishAttempt(ErrorCode::INVALID_PARAMS, false);
+        return ErrorCode::INVALID_PARAMS;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (next_prune_check_ && Now() < *next_prune_check_) {
+            attempt_in_flight_ = false;
+            cv_.notify_all();
+            return ErrorCode::OK;
+        }
+    }
+    // Avoid acquiring a maintenance lease when no reader-visible floor exists.
+    // Resume re-reads the authoritative floor after acquiring the lease.
+    std::string floor;
+    auto error = backend_.Get(
+        ha::BuildBatchOpLogSnapshotCompactionFloorKey(cluster_id_), floor);
+    if (error != ErrorCode::OK) {
+        const bool missing = error == ErrorCode::ETCD_KEY_NOT_EXIST;
+        if (missing) error = ErrorCode::OK;
+        SchedulePruneContinuation(!missing, error);
+        FinishAttempt(error, false);
+        return error;
+    }
+    auto lease = lease_factory_();
+    if (!lease) {
+        SchedulePruneContinuation(true, ErrorCode::ETCD_TRANSACTION_FAIL);
+        FinishAttempt(ErrorCode::OK, false);
+        return ErrorCode::OK;
+    }
+    error = lease->IsHeld() ? ErrorCode::OK : lease->Acquire();
+    if (error != ErrorCode::OK) {
+        SchedulePruneContinuation(true, error);
+        const auto result =
+            error == ErrorCode::ETCD_TRANSACTION_FAIL ? ErrorCode::OK : error;
+        FinishAttempt(result, false);
+        return result;
+    }
+    const auto cancelled = [this] {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return stop_requested_ || promotion_requested_;
+    };
+    bool more_work = true;
+    BatchOpLogPruningCoordinator pruning(backend_, object_store_, cluster_id_,
+                                         config_.snapshot_root,
+                                         config_.pruning);
+    error = pruning.Resume(*lease, cancelled, &more_work);
+    (void)lease->Release();
+    SchedulePruneContinuation(more_work, error);
+    FinishAttempt(error, false);
+    return error;
 }
 
 ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
@@ -324,17 +426,12 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
     const auto local_prefix = standby_.GetLastAppliedBatchOpLogSnapshotPrefix();
     if (!local_prefix || local_prefix->batch_id <= *latest_batch_id) {
         HAMetricManager::instance().record_snapshot_skip(Skip::NoNewBatch);
-        FinishAttempt(ErrorCode::OK, false);
-        return ErrorCode::OK;
+        return RunPruneAttempt();
     }
     bool catch_up_blocked = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (attempt_in_flight_) {
-            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
-        }
         catch_up_blocked = catch_up_target_.has_value();
-        attempt_in_flight_ = true;
     }
     if (catch_up_blocked) {
         std::optional<DurablePrefix> target;
@@ -539,14 +636,19 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         // pruning, including when it throws. Keep the publication successful.
         try {
             BatchOpLogPruningCoordinator pruning(
-                backend_, object_store_, cluster_id_, config_.snapshot_root);
-            const auto error = pruning.Run(*lease, cancelled);
+                backend_, object_store_, cluster_id_, config_.snapshot_root,
+                config_.pruning);
+            bool more_work = false;
+            const auto error = pruning.Run(*lease, cancelled, &more_work);
+            SchedulePruneContinuation(more_work, error);
             if (error != ErrorCode::OK)
                 LOG(WARNING) << "Batch OpLog pruning skipped or failed: "
                              << static_cast<int>(error);
         } catch (const std::exception& e) {
+            SchedulePruneContinuation(true, ErrorCode::INTERNAL_ERROR);
             LOG(WARNING) << "Batch OpLog pruning threw: " << e.what();
         } catch (...) {
+            SchedulePruneContinuation(true, ErrorCode::INTERNAL_ERROR);
             LOG(WARNING) << "Batch OpLog pruning threw unknown exception";
         }
     }
@@ -559,10 +661,16 @@ void BatchOpLogSnapshotCoordinator::SchedulerLoop() {
     while (true) {
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            const auto delay =
-                std::chrono::seconds(config_.snapshot_interval_seconds == 0
-                                         ? 1
-                                         : config_.snapshot_interval_seconds);
+            // Poll snapshot eligibility at most once per second, but continue
+            // a partial prune promptly without waiting for another snapshot.
+            auto delay = std::chrono::milliseconds(1000);
+            if (next_prune_check_ && !promotion_requested_) {
+                const auto remaining =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        *next_prune_check_ - Now());
+                delay =
+                    std::clamp(remaining, std::chrono::milliseconds(1), delay);
+            }
             if (cv_.wait_for(lock, delay, [this] { return stop_requested_; })) {
                 return;
             }

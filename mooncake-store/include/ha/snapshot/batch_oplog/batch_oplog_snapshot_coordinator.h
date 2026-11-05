@@ -12,6 +12,7 @@
 #include <thread>
 
 #include "ha/oplog/oplog_batch_types.h"
+#include "ha/snapshot/batch_oplog/batch_oplog_pruning_coordinator.h"
 #include "types.h"
 
 namespace mooncake {
@@ -29,6 +30,7 @@ struct BatchOpLogSnapshotCoordinatorConfig {
     size_t chunk_object_count{1000000};
     std::string snapshot_root;
     std::function<std::chrono::steady_clock::time_point()> clock;
+    BatchOpLogPruningConfig pruning;
 };
 
 struct BatchOpLogSnapshotCoordinatorStatus {
@@ -38,6 +40,8 @@ struct BatchOpLogSnapshotCoordinatorStatus {
     uint64_t attempts{0};
     ErrorCode last_error{ErrorCode::OK};
     std::optional<DurablePrefix> catch_up_target;
+    bool prune_pending{false};
+    ErrorCode last_prune_error{ErrorCode::OK};
 };
 
 // Coordinates the opt-in batch-OpLog snapshot path. Construction alone does
@@ -93,6 +97,8 @@ class BatchOpLogSnapshotCoordinator final {
 
     void SchedulerLoop();
     ErrorCode RunAttempt();
+    ErrorCode RunPruneAttempt();
+    void SchedulePruneContinuation(bool more_work, ErrorCode error);
     std::optional<uint64_t> ReadLatestBatchId(ErrorCode& error) const;
     bool CatchUpComplete(const DurablePrefix& target) const;
     void FinishAttempt(ErrorCode error, bool count_attempt);
@@ -119,6 +125,10 @@ class BatchOpLogSnapshotCoordinator final {
     uint64_t attempts_{0};
     ErrorCode last_error_{ErrorCode::OK};
     std::optional<Clock::time_point> last_attempt_complete_;
+    std::optional<Clock::time_point> snapshot_not_before_;
+    std::optional<Clock::time_point> next_prune_check_;
+    bool prune_pending_{false};
+    ErrorCode last_prune_error_{ErrorCode::OK};
     std::optional<DurablePrefix> capture_cursor_;
     std::optional<DurablePrefix> catch_up_target_;
 };

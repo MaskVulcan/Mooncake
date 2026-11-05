@@ -53,8 +53,34 @@ class EmptyBackend final : public HaKvBackend {
         return ErrorCode::OK;
     }
 
+    ErrorCode RangeKeys(std::string_view begin, std::string_view end,
+                        size_t limit,
+                        std::vector<std::string>& output) override {
+        output.clear();
+        for (const auto& [key, value] : values) {
+            if (key >= begin && key < end && output.size() < limit)
+                output.push_back(key);
+        }
+        return ErrorCode::OK;
+    }
+    ErrorCode DeleteRangeCounted(std::string_view begin, std::string_view end,
+                                 uint64_t& deleted) override {
+        deleted = 0;
+        ++delete_requests;
+        if (on_delete) on_delete();
+        if (delete_error != ErrorCode::OK) return delete_error;
+        for (auto it = values.lower_bound(std::string(begin));
+             it != values.end() && it->first < end;) {
+            it = values.erase(it);
+            ++deleted;
+        }
+        return ErrorCode::OK;
+    }
     bool SupportsTxn() const override { return true; }
     ErrorCode Txn(const KvTxn&) override { return ErrorCode::OK; }
+    ErrorCode delete_error{ErrorCode::OK};
+    size_t delete_requests{0};
+    std::function<void()> on_delete;
 
     ErrorCode get_error{ErrorCode::OK};
     std::map<std::string, std::string> values;
@@ -326,6 +352,124 @@ TEST(BatchOpLogSnapshotCoordinatorTest, EmptyStandbySkipsWithoutLease) {
     EXPECT_TRUE(coordinator.IsRunning());
     coordinator.Stop();
     EXPECT_FALSE(coordinator.IsRunning());
+}
+
+TEST(BatchOpLogSnapshotCoordinatorTest,
+     ResumesPublishedFloorWithoutNewSnapshotAndBacksOffFailures) {
+    HotStandbyConfig standby_config;
+    standby_config.enable_verification = false;
+    HotStandbyService standby(standby_config);
+    EmptyBackend backend;
+    UnusedObjectStore objects;
+    auto now = std::chrono::steady_clock::now();
+    BatchOpLogSnapshotCoordinatorConfig config;
+    config.snapshot_root = "snapshots";
+    config.clock = [&] { return now; };
+    config.pruning.max_batches_per_request = 1;
+    config.pruning.batch_interval_ms = 0;
+    const auto floor_key =
+        ha::BuildBatchOpLogSnapshotCompactionFloorKey("cluster");
+    backend.values[floor_key] = "20";
+    for (uint64_t id = 1; id <= 21; ++id)
+        backend.values[BuildBatchRecordKey("cluster", id)] = "value";
+    BatchOpLogSnapshotCoordinator coordinator(
+        standby, backend, objects, "cluster", config, [] {
+            return SnapshotMaintenanceLease::MakeForTesting("cluster", "101",
+                                                            1);
+        });
+    // No local applied prefix or snapshot exists, but a prior fenced floor
+    // does.
+    EXPECT_EQ(ErrorCode::OK, coordinator.RunOnce());
+    EXPECT_EQ(16u, backend.delete_requests);
+    EXPECT_TRUE(coordinator.GetStatus().prune_pending);
+    EXPECT_EQ(0u, coordinator.GetStatus().attempts);
+    EXPECT_EQ("20", backend.values[floor_key]);
+    EXPECT_EQ(ErrorCode::OK, coordinator.RunOnce());
+    EXPECT_EQ(16u, backend.delete_requests);  // continuation interval respected
+    now += std::chrono::milliseconds(20);
+    backend.delete_error = ErrorCode::ETCD_OPERATION_ERROR;
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, coordinator.RunOnce());
+    EXPECT_EQ(17u, backend.delete_requests);
+    EXPECT_TRUE(backend.values.contains(BuildBatchRecordKey("cluster", 17)));
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR,
+              coordinator.GetStatus().last_prune_error);
+    now += std::chrono::seconds(4);
+    backend.delete_error = ErrorCode::OK;
+    EXPECT_EQ(ErrorCode::OK, coordinator.RunOnce());
+    EXPECT_EQ(17u, backend.delete_requests);  // no busy-loop after error
+    now += std::chrono::seconds(1);
+    EXPECT_EQ(ErrorCode::OK, coordinator.RunOnce());
+    EXPECT_EQ(21u, backend.delete_requests);
+    EXPECT_FALSE(coordinator.GetStatus().prune_pending);
+    EXPECT_TRUE(backend.values.contains(BuildBatchRecordKey("cluster", 21)));
+    EXPECT_FALSE(backend.values.contains(BuildBatchRecordKey("cluster", 20)));
+    EXPECT_EQ(0u, coordinator.GetStatus().attempts);
+}
+
+TEST(BatchOpLogSnapshotCoordinatorTest,
+     CleanupExcludesConcurrentRunAndStopsOnPromotion) {
+    HotStandbyConfig standby_config;
+    standby_config.enable_verification = false;
+    HotStandbyService standby(standby_config);
+    EmptyBackend backend;
+    UnusedObjectStore objects;
+    backend.values[ha::BuildBatchOpLogSnapshotCompactionFloorKey("cluster")] =
+        "2";
+    backend.values[BuildBatchRecordKey("cluster", 1)] = "value";
+    backend.values[BuildBatchRecordKey("cluster", 2)] = "value";
+    BatchOpLogSnapshotCoordinatorConfig config;
+    config.snapshot_root = "snapshots";
+    config.pruning.max_batches_per_request = 1;
+    config.pruning.batch_interval_ms = 0;
+    BatchOpLogSnapshotCoordinator coordinator(
+        standby, backend, objects, "cluster", config, [] {
+            return SnapshotMaintenanceLease::MakeForTesting("cluster", "101",
+                                                            1);
+        });
+    backend.on_delete = [&] {
+        EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS,
+                  coordinator.RunOnce());
+        coordinator.NotifyPromotion();
+    };
+    EXPECT_EQ(ErrorCode::OK, coordinator.RunOnce());
+    EXPECT_EQ(1u, backend.delete_requests);
+    EXPECT_TRUE(backend.values.contains(BuildBatchRecordKey("cluster", 2)));
+    EXPECT_FALSE(coordinator.IsAttemptInFlight());
+    EXPECT_EQ(ErrorCode::OK, coordinator.RunOnce());
+    EXPECT_EQ(1u, backend.delete_requests);
+}
+
+TEST(BatchOpLogSnapshotCoordinatorTest,
+     BackgroundCleanupRunsBeforeSnapshotIntervalAndStopsCleanly) {
+    HotStandbyConfig standby_config;
+    standby_config.enable_verification = false;
+    HotStandbyService standby(standby_config);
+    EmptyBackend backend;
+    UnusedObjectStore objects;
+    backend.values[ha::BuildBatchOpLogSnapshotCompactionFloorKey("cluster")] =
+        "1";
+    backend.values[BuildBatchRecordKey("cluster", 1)] = "value";
+    BatchOpLogSnapshotCoordinatorConfig config;
+    config.snapshot_root = "snapshots";
+    config.snapshot_interval_seconds = 600;
+    config.pruning.batch_interval_ms = 0;
+    std::atomic<bool> deleted{false};
+    backend.on_delete = [&] { deleted = true; };
+    BatchOpLogSnapshotCoordinator coordinator(
+        standby, backend, objects, "cluster", config, [] {
+            return SnapshotMaintenanceLease::MakeForTesting("cluster", "101",
+                                                            1);
+        });
+    coordinator.Start();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!deleted && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    coordinator.Stop();
+    EXPECT_TRUE(deleted);
+    EXPECT_EQ(1u, backend.delete_requests);
+    EXPECT_EQ(0u, coordinator.GetStatus().attempts);
+    EXPECT_FALSE(coordinator.IsAttemptInFlight());
 }
 
 TEST(BatchOpLogSnapshotCoordinatorTest,
