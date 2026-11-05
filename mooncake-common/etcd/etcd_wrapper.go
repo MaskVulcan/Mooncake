@@ -112,7 +112,7 @@ var (
 	storeClient *clientv3.Client
 	storeMutex  sync.Mutex
 	// keep alive contexts for store
-	storeKeepAliveCtx   = make(map[int64]context.CancelFunc)
+	storeKeepAliveCtx   = make(map[int64]*leaseKeepAliveState)
 	storeKeepAliveMutex sync.Mutex
 	// maintenance sessions own their keepalive and lease lifecycle in Go.
 	storeMaintenanceSessions   = make(map[int64]*maintenanceSession)
@@ -897,31 +897,51 @@ func EtcdStoreCancelWatchWrapper(key *C.char, keySize C.int, errMsg **C.char) in
 	return 0
 }
 
-/*
-* @brief First cancel the keep alive context, then delete it from the map.
-*        Cancel must be called before deleting in case this is a new context
-*        other than the one we want to delete. In that case, that context will
-*        be deleted before being cancelled and will not be able to be cancelled
-*        anymore.
- */
+// A stream owns its readiness and cleanup. A delayed response or deferred
+// cleanup from a cancelled stream must not affect a replacement for the lease.
+type leaseKeepAliveState struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	ready  bool // protected by storeKeepAliveMutex
+}
+
 func cancelAndDeleteKeepAlive(leaseId int64) int {
 	storeKeepAliveMutex.Lock()
 	defer storeKeepAliveMutex.Unlock()
-
-	if cancel, exists := storeKeepAliveCtx[leaseId]; exists {
-		cancel()
+	if state, exists := storeKeepAliveCtx[leaseId]; exists {
+		state.cancel()
 		delete(storeKeepAliveCtx, leaseId)
 		return 0
 	}
 	return -1
 }
 
-func hasKeepAliveContext(leaseId int64) bool {
+func finishKeepAlive(leaseId int64, state *leaseKeepAliveState) {
 	storeKeepAliveMutex.Lock()
 	defer storeKeepAliveMutex.Unlock()
+	state.cancel()
+	if storeKeepAliveCtx[leaseId] == state {
+		delete(storeKeepAliveCtx, leaseId)
+	}
+}
 
-	_, exists := storeKeepAliveCtx[leaseId]
-	return exists
+func hasKeepAliveAcknowledgement(leaseId int64) bool {
+	storeKeepAliveMutex.Lock()
+	defer storeKeepAliveMutex.Unlock()
+	state := storeKeepAliveCtx[leaseId]
+	return state != nil && state.ready && state.ctx.Err() == nil
+}
+
+func acknowledgeKeepAlive(leaseId int64, state *leaseKeepAliveState,
+	response *clientv3.LeaseKeepAliveResponse) bool {
+	storeKeepAliveMutex.Lock()
+	defer storeKeepAliveMutex.Unlock()
+	if state == nil || storeKeepAliveCtx[leaseId] != state || state.ctx.Err() != nil ||
+		response == nil || response.ID != clientv3.LeaseID(leaseId) || response.TTL <= 0 {
+		return false
+	}
+	state.ready = true
+	return true
 }
 
 //export EtcdStoreKeepAliveWrapper
@@ -947,6 +967,7 @@ func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
 
 	// Create a context with cancel function
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// Store the cancel function
 	storeKeepAliveMutex.Lock()
@@ -955,10 +976,10 @@ func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
 		*errMsg = C.CString("This lease id is already being kept alive")
 		return -1
 	}
-	storeKeepAliveCtx[leaseId] = cancel
+	state := &leaseKeepAliveState{ctx: ctx, cancel: cancel}
+	storeKeepAliveCtx[leaseId] = state
 	storeKeepAliveMutex.Unlock()
-	// Make sure to delete from the map before returning
-	defer cancelAndDeleteKeepAlive(leaseId)
+	defer finishKeepAlive(leaseId, state)
 
 	// Start keep alive
 	keepAliveChan, err := cli.KeepAlive(ctx, clientv3.LeaseID(leaseId))
@@ -979,7 +1000,10 @@ func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
 				*errMsg = C.CString("keep alive response is nil")
 				return -1
 			}
-			// Keep alive successful, continue
+			if !acknowledgeKeepAlive(leaseId, state, resp) {
+				*errMsg = C.CString("keep alive lease expired or cancelled")
+				return -1
+			}
 		case <-ctx.Done():
 			// Context cancelled
 			*errMsg = C.CString("keep alive context cancelled")
@@ -997,19 +1021,28 @@ func EtcdStoreCancelKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
 	return 0
 }
 
-//export EtcdStoreWaitKeepAliveReadyWrapper
-func EtcdStoreWaitKeepAliveReadyWrapper(leaseId int64, timeoutMs int, errMsg **C.char) int {
-	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+// Readiness confirms a response from etcd, rather than merely the creation of
+// a local goroutine. A timeout does not cancel the keepalive stream.
+func waitKeepAliveReady(leaseId int64, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
 	for {
-		if hasKeepAliveContext(leaseId) {
-			return 0
+		if hasKeepAliveAcknowledgement(leaseId) {
+			return nil
 		}
-		if timeoutMs <= 0 || !time.Now().Before(deadline) {
-			*errMsg = C.CString("keep alive context did not become ready before timeout")
-			return -1
+		if timeout <= 0 || !time.Now().Before(deadline) {
+			return errors.New("keep alive was not acknowledged by etcd before timeout")
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+//export EtcdStoreWaitKeepAliveReadyWrapper
+func EtcdStoreWaitKeepAliveReadyWrapper(leaseId int64, timeoutMs int, errMsg **C.char) int {
+	if err := waitKeepAliveReady(leaseId, time.Duration(timeoutMs)*time.Millisecond); err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
 }
 
 //export EtcdStorePutWrapper
