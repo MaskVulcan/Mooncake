@@ -2,11 +2,15 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
+#include <glog/logging.h>
+#include <limits>
+#include <thread>
 #include <utility>
 
 #include "crc32c.h"
 #include "ha/kv/ha_kv_backend.h"
-#include "ha/oplog/oplog_batch_storage.h"
+#include "ha/oplog/oplog_batch_types.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "ha/snapshot/snapshot_maintenance_lease.h"
@@ -15,6 +19,29 @@
 
 namespace mooncake {
 namespace {
+
+constexpr size_t kMaxRequestsPerPass = 16;
+constexpr auto kMaxPassTime = std::chrono::seconds(1);
+
+bool ParseFloor(const std::string& value, uint64_t& floor) {
+    const auto parsed =
+        std::from_chars(value.data(), value.data() + value.size(), floor);
+    return !value.empty() && parsed.ec == std::errc() &&
+           parsed.ptr == value.data() + value.size();
+}
+
+bool ParseBatchKey(const std::string& key, const std::string& prefix,
+                   uint64_t& batch_id) {
+    if (!key.starts_with(prefix) ||
+        key.size() != prefix.size() + kOpLogBatchIdWidth)
+        return false;
+    const auto* begin = key.data() + prefix.size();
+    const auto* end = key.data() + key.size();
+    if (!std::all_of(begin, end, [](char c) { return c >= '0' && c <= '9'; }))
+        return false;
+    const auto parsed = std::from_chars(begin, end, batch_id);
+    return parsed.ec == std::errc() && parsed.ptr == end;
+}
 
 bool InspectArtifact(SnapshotObjectStore& store, const std::string& key,
                      uint64_t size, uint32_t crc) {
@@ -81,15 +108,29 @@ bool ValidateSnapshot(SnapshotObjectStore& store, const std::string& root,
 
 BatchOpLogPruningCoordinator::BatchOpLogPruningCoordinator(
     HaKvBackend& backend, SnapshotObjectStore& object_store,
-    std::string cluster_id, std::string snapshot_root)
+    std::string cluster_id, std::string snapshot_root,
+    BatchOpLogPruningConfig config)
     : backend_(backend),
       object_store_(object_store),
       cluster_id_(std::move(cluster_id)),
-      snapshot_root_(std::move(snapshot_root)) {}
+      snapshot_root_(std::move(snapshot_root)),
+      config_(config) {}
+
+bool BatchOpLogPruningCoordinator::ValidContext(
+    const SnapshotMaintenanceLease& lease) const {
+    const auto lock_key =
+        ha::BuildBatchOpLogSnapshotMaintenanceKey(cluster_id_);
+    return !lock_key.empty() && lease.lock_key() == lock_key &&
+           config_.max_batches_per_request != 0 &&
+           config_.max_batches_per_request <=
+               static_cast<size_t>(std::numeric_limits<int>::max()) &&
+           config_.batch_interval_ms <= std::numeric_limits<uint32_t>::max();
+}
 
 ErrorCode BatchOpLogPruningCoordinator::Run(
     const SnapshotMaintenanceLease& lease,
-    const std::function<bool()>& cancelled) {
+    const std::function<bool()>& cancelled, bool* more_work) {
+    if (more_work) *more_work = false;
     HAMetricManager::SnapshotOperationTimer metric_timer(
         HAMetricManager::SnapshotOperation::Prune);
     const auto latest_key = ha::BuildBatchOpLogSnapshotLatestKey(cluster_id_);
@@ -99,8 +140,8 @@ ErrorCode BatchOpLogPruningCoordinator::Run(
         ha::BuildBatchOpLogSnapshotCompactionFloorKey(cluster_id_);
     const auto lock_key =
         ha::BuildBatchOpLogSnapshotMaintenanceKey(cluster_id_);
-    if (latest_key.empty() || snapshot_root_.empty() ||
-        lease.lock_key() != lock_key || !backend_.SupportsTxn())
+    if (!ValidContext(lease) || snapshot_root_.empty() ||
+        !backend_.SupportsTxn())
         return ErrorCode::INVALID_PARAMS;
     const auto stopped = [&] {
         return !lease.IsHeld() || (cancelled && cancelled());
@@ -141,11 +182,8 @@ ErrorCode BatchOpLogPruningCoordinator::Run(
     const bool floor_exists = error == ErrorCode::OK;
     if (!floor_exists && error != ErrorCode::ETCD_KEY_NOT_EXIST) return error;
     if (floor_exists) {
-        const auto parsed = std::from_chars(
-            old_floor.data(), old_floor.data() + old_floor.size(), floor);
-        if (parsed.ec != std::errc() ||
-            parsed.ptr != old_floor.data() + old_floor.size())
-            return ErrorCode::INTERNAL_ERROR;
+        if (!ParseFloor(old_floor, floor)) return ErrorCode::INTERNAL_ERROR;
+        if (more_work) *more_work = true;
         HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
             metrics.compaction_floor =
                 std::max(metrics.compaction_floor, floor);
@@ -190,14 +228,119 @@ ErrorCode BatchOpLogPruningCoordinator::Run(
             std::max(metrics.compaction_floor, candidate);
         metrics.floor_advances_total += candidate > floor;
     });
-    // Even if the lease is lost now, this range has already been advertised to
-    // readers. A crash or failed delete leaves the floor in place; a later
-    // successful publication can safely repeat this bounded deletion.
-    if (stopped()) return metric_timer.Success(ErrorCode::OK);
-    const auto delete_error = OpLogBatchStorage(cluster_id_, backend_)
-                                  .DeleteBatchesThrough(candidate);
+    // The floor is the reader's recovery boundary, not evidence that every
+    // physical key has been removed. Resume can finish this prefix without
+    // another snapshot publication after a partial pass, failure or crash.
+    const auto delete_error = Drain(candidate, lease, cancelled, more_work);
     metric_timer.error = static_cast<int64_t>(delete_error);
     return delete_error;
+}
+
+ErrorCode BatchOpLogPruningCoordinator::Resume(
+    const SnapshotMaintenanceLease& lease,
+    const std::function<bool()>& cancelled, bool* more_work) {
+    if (more_work) *more_work = false;
+    HAMetricManager::SnapshotOperationTimer metric_timer(
+        HAMetricManager::SnapshotOperation::Prune);
+    if (!ValidContext(lease)) return ErrorCode::INVALID_PARAMS;
+    if (!lease.IsHeld() || (cancelled && cancelled()))
+        return ErrorCode::ETCD_TRANSACTION_FAIL;
+    std::string value;
+    const auto error = backend_.Get(
+        ha::BuildBatchOpLogSnapshotCompactionFloorKey(cluster_id_), value);
+    if (error == ErrorCode::ETCD_KEY_NOT_EXIST)
+        return metric_timer.Success(ErrorCode::OK);
+    if (error != ErrorCode::OK) return error;
+    uint64_t floor = 0;
+    if (!ParseFloor(value, floor)) return ErrorCode::INTERNAL_ERROR;
+    HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+        metrics.compaction_floor = std::max(metrics.compaction_floor, floor);
+    });
+    const auto delete_error = Drain(floor, lease, cancelled, more_work);
+    metric_timer.error = static_cast<int64_t>(delete_error);
+    return delete_error;
+}
+
+ErrorCode BatchOpLogPruningCoordinator::Drain(
+    uint64_t floor, const SnapshotMaintenanceLease& lease,
+    const std::function<bool()>& cancelled, bool* more_work) {
+    if (more_work) *more_work = true;
+    const auto stopped = [&] {
+        return !lease.IsHeld() || (cancelled && cancelled());
+    };
+    const auto begin = BuildBatchRecordKey(cluster_id_, 0);
+    const auto end = BuildBatchRecordRange(cluster_id_, floor).begin_key;
+    if (begin.empty() || end.empty() || begin >= end)
+        return ErrorCode::INVALID_PARAMS;
+    const auto prefix = begin.substr(0, begin.size() - kOpLogBatchIdWidth);
+    const auto deadline = std::chrono::steady_clock::now() + kMaxPassTime;
+    for (size_t request = 0; request < kMaxRequestsPerPass; ++request) {
+        if (stopped() || std::chrono::steady_clock::now() >= deadline)
+            return ErrorCode::OK;
+        std::vector<std::string> keys;
+        auto error = backend_.RangeKeys(begin, end,
+                                        config_.max_batches_per_request, keys);
+        if (error != ErrorCode::OK) return error;
+        if (keys.empty()) {
+            if (more_work) *more_work = false;
+            return ErrorCode::OK;
+        }
+        if (keys.size() > config_.max_batches_per_request)
+            return ErrorCode::INTERNAL_ERROR;
+        uint64_t last_batch_id = 0;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            uint64_t batch_id = 0;
+            if (!ParseBatchKey(keys[i], prefix, batch_id) || batch_id > floor ||
+                keys[i] < begin || keys[i] >= end ||
+                (i != 0 && keys[i - 1] >= keys[i]))
+                return ErrorCode::INTERNAL_ERROR;
+            last_batch_id = batch_id;
+        }
+        const auto chunk_end =
+            BuildBatchRecordRange(cluster_id_, last_batch_id).begin_key;
+        // Permit the first deletion even when its boundary lookup used the
+        // pass budget. Otherwise consistently slow reads could prevent any
+        // cleanup progress. Cancellation and lease ownership still gate it.
+        if (stopped() ||
+            (request != 0 && std::chrono::steady_clock::now() >= deadline))
+            return ErrorCode::OK;
+        uint64_t deleted = 0;
+        const auto started = std::chrono::steady_clock::now();
+        error = backend_.DeleteRangeCounted(keys.front(), chunk_end, deleted);
+        const auto elapsed_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started)
+                .count();
+        LOG(INFO) << "[SnapshotPrune] chunk cluster=" << cluster_id_
+                  << " floor=" << floor << " begin=" << keys.front()
+                  << " end=" << chunk_end << " selected=" << keys.size()
+                  << " deleted=" << deleted << " elapsed_us=" << elapsed_us
+                  << " error=" << static_cast<int64_t>(error);
+        if (error != ErrorCode::OK) return error;
+        // Below the published floor, batch records are immutable and no new
+        // keys can be inserted by a producer. A mismatched count means the
+        // backend violated its bounded range/count contract or another owner
+        // made progress. Retrying starts with a fresh oldest-key query.
+        if (deleted > keys.size()) return ErrorCode::INTERNAL_ERROR;
+        if (deleted == 0) return ErrorCode::ETCD_OPERATION_ERROR;
+        // Bound the maintenance pass between RPCs, not the server's apply time.
+        // The scheduler also yields between passes, allowing snapshot work and
+        // lease renewal to run instead of issuing an unbounded deletion loop.
+        const auto wait_ms =
+            std::min<uint64_t>(config_.batch_interval_ms, 1000);
+        const auto wake =
+            std::min(deadline, std::chrono::steady_clock::now() +
+                                   std::chrono::milliseconds(wait_ms));
+        while (std::chrono::steady_clock::now() < wake) {
+            if (stopped()) return ErrorCode::OK;
+            std::this_thread::sleep_until(
+                std::min(wake, std::chrono::steady_clock::now() +
+                                   std::chrono::milliseconds(10)));
+        }
+    }
+    // Deliberately do not infer completion from the logical floor or a short
+    // final page. Only an empty query in a subsequent pass proves completion.
+    return ErrorCode::OK;
 }
 
 }  // namespace mooncake

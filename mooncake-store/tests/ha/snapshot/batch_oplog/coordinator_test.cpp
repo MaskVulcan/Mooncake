@@ -103,6 +103,32 @@ class RecordingBackend final : public HaKvBackend {
                       values_.lower_bound(std::string(end)));
         return ErrorCode::OK;
     }
+    ErrorCode RangeKeys(std::string_view begin, std::string_view end,
+                        size_t limit,
+                        std::vector<std::string>& output) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        output.clear();
+        for (const auto& [key, value] : values_) {
+            if (key >= begin && key < end && output.size() < limit)
+                output.push_back(key);
+        }
+        return ErrorCode::OK;
+    }
+    ErrorCode DeleteRangeCounted(std::string_view begin, std::string_view end,
+                                 uint64_t& deleted) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        EXPECT_EQ(
+            "1",
+            values_[ha::BuildBatchOpLogSnapshotCompactionFloorKey("cluster")]);
+        ++delete_count;
+        deleted = 0;
+        for (auto it = values_.lower_bound(std::string(begin));
+             it != values_.end() && it->first < end;) {
+            it = values_.erase(it);
+            ++deleted;
+        }
+        return ErrorCode::OK;
+    }
     size_t delete_count{0};
 
     ErrorCode Get(std::string_view key, std::string& value) override {

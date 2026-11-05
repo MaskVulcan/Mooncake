@@ -2,10 +2,15 @@
 #include "ha/snapshot/batch_oplog/batch_oplog_pruning_coordinator.h"
 
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <functional>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "crc32c.h"
@@ -25,15 +30,34 @@ namespace mooncake::test {
 namespace {
 class FakeBackend final : public HaKvBackend {
    public:
-    ErrorCode DeleteRange(std::string_view, std::string_view) override {
+    ErrorCode DeleteRange(std::string_view begin,
+                          std::string_view end) override {
+        uint64_t ignored = 0;
+        return DeleteRangeCounted(begin, end, ignored);
+    }
+
+    ErrorCode DeleteRangeCounted(std::string_view begin, std::string_view end,
+                                 uint64_t& deleted) override {
         ++delete_count;
+        deleted = 0;
+        delete_ranges.emplace_back(begin, end);
         EXPECT_TRUE(values.contains(
             ha::BuildBatchOpLogSnapshotCompactionFloorKey("cluster")));
         if (before_delete) before_delete();
+        if (delete_error != ErrorCode::OK && !apply_on_delete_error)
+            return delete_error;
+        auto first = values.lower_bound(std::string(begin));
+        const auto last = values.lower_bound(std::string(end));
+        const auto count = static_cast<uint64_t>(std::distance(first, last));
+        values.erase(first, last);
+        deleted_counts.push_back(count);
+        if (delete_error == ErrorCode::OK) deleted = count;
+        if (after_delete) after_delete();
         return delete_error;
     }
 
     ErrorCode Get(std::string_view key, std::string& value) override {
+        gets.emplace_back(key);
         auto it = values.find(std::string(key));
         if (it == values.end()) return ErrorCode::ETCD_KEY_NOT_EXIST;
         value = it->second;
@@ -51,6 +75,21 @@ class FakeBackend final : public HaKvBackend {
 
     ErrorCode Range(std::string_view, std::string_view, size_t,
                     std::vector<KvPair>&) override {
+        ADD_FAILURE() << "Pruning must not fetch oplog values";
+        return ErrorCode::OK;
+    }
+
+    ErrorCode RangeKeys(std::string_view begin, std::string_view end,
+                        size_t limit, std::vector<std::string>& keys) override {
+        ++range_count;
+        keys.clear();
+        if (before_range) before_range();
+        if (range_error != ErrorCode::OK) return range_error;
+        for (auto it = values.lower_bound(std::string(begin));
+             it != values.end() && it->first < end && keys.size() < limit; ++it)
+            keys.push_back(it->first);
+        if (mutate_range_results) mutate_range_results(keys);
+        if (after_range) after_range();
         return ErrorCode::OK;
     }
 
@@ -93,8 +132,18 @@ class FakeBackend final : public HaKvBackend {
     }
 
     size_t delete_count{0};
+    size_t range_count{0};
     ErrorCode delete_error{ErrorCode::OK};
+    ErrorCode range_error{ErrorCode::OK};
+    bool apply_on_delete_error{false};
+    std::vector<std::pair<std::string, std::string>> delete_ranges;
+    std::vector<uint64_t> deleted_counts;
+    std::vector<std::string> gets;
     std::function<void()> before_delete;
+    std::function<void()> after_delete;
+    std::function<void()> before_range;
+    std::function<void()> after_range;
+    std::function<void(std::vector<std::string>&)> mutate_range_results;
     std::function<void()> after_txn;
     std::map<std::string, std::string> values;
     std::map<std::string, EtcdRevisionId> create_revisions;
@@ -224,8 +273,18 @@ class PruningTest : public ::testing::Test {
         fallback = AddSnapshot(store, 10);
         backend.Put(latest_key, latest);
         backend.Put(fallback_key, fallback);
+        backend.Put(BuildBatchRecordKey("cluster", 10), "batch");
+        backend.Put(BuildBatchRecordKey("cluster", 20), "batch");
     }
     ErrorCode Run() { return pruning.Run(*lease); }
+    void SetBatches(std::initializer_list<uint64_t> ids) {
+        const auto first = BuildBatchRecordKey("cluster", 0);
+        const auto last = BuildBatchRecordRange("cluster", UINT64_MAX).end_key;
+        backend.values.erase(backend.values.lower_bound(first),
+                             backend.values.lower_bound(last));
+        for (const auto id : ids)
+            backend.Put(BuildBatchRecordKey("cluster", id), "batch");
+    }
     const std::string latest_key =
         ha::BuildBatchOpLogSnapshotLatestKey("cluster");
     const std::string fallback_key =
@@ -417,13 +476,18 @@ TEST_F(PruningTest, DeleteFailureKeepsFloorAndRetries) {
 
 TEST_F(PruningTest, CrashAfterCasLeavesReaderVisibleFloorForRetry) {
     bool stopped = false;
+    bool more = false;
     backend.after_txn = [&] { stopped = true; };
-    EXPECT_EQ(ErrorCode::OK, pruning.Run(*lease, [&] { return stopped; }));
+    EXPECT_EQ(ErrorCode::OK,
+              pruning.Run(*lease, [&] { return stopped; }, &more));
+    EXPECT_TRUE(more);
     EXPECT_EQ("10", backend.values[floor_key]);
     EXPECT_EQ(0u, backend.delete_count);
     backend.after_txn = {};
-    EXPECT_EQ(ErrorCode::OK, Run());
+    EXPECT_EQ(ErrorCode::OK, pruning.Resume(*lease, {}, &more));
+    EXPECT_FALSE(more);
     EXPECT_EQ(1u, backend.delete_count);
+    EXPECT_EQ(1u, backend.txn_count);
 }
 
 TEST_F(PruningTest, FloorNeverRegressesAndParsingIsStrict) {
@@ -450,17 +514,298 @@ TEST_F(PruningTest, CancelledOrReleasedLeaseDoesNotDelete) {
     EXPECT_EQ(0u, backend.delete_count);
 }
 
+TEST_F(PruningTest, ChunksAtTheLimitAndOneAboveItWithoutFetchingValues) {
+    for (const size_t count : {3u, 4u, 5u}) {
+        SCOPED_TRACE(count);
+        SetBatches({});
+        for (size_t id = 0; id < count; ++id)
+            backend.Put(BuildBatchRecordKey("cluster", id), "batch");
+        backend.deleted_counts.clear();
+        BatchOpLogPruningCoordinator bounded(
+            backend, store, "cluster", "snapshots",
+            {.max_batches_per_request = 4, .batch_interval_ms = 0});
+        bool more = true;
+        ASSERT_EQ(ErrorCode::OK, bounded.Run(*lease, {}, &more));
+        EXPECT_FALSE(more);
+        ASSERT_EQ(count <= 4 ? 1u : 2u, backend.deleted_counts.size());
+        EXPECT_EQ(std::min<size_t>(count, 4), backend.deleted_counts[0]);
+        if (count == 5) EXPECT_EQ(1u, backend.deleted_counts[1]);
+        EXPECT_EQ("10", backend.values[floor_key]);
+    }
+}
+
+TEST_F(PruningTest, ResumeUsesPublishedFloorWithoutSnapshotPointers) {
+    backend.values[floor_key] = "10";
+    backend.values.erase(latest_key);
+    backend.values.erase(fallback_key);
+    store.objects.clear();
+    bool more = true;
+    EXPECT_EQ(ErrorCode::OK, pruning.Resume(*lease, {}, &more));
+    EXPECT_FALSE(more);
+    EXPECT_EQ(0u, backend.txn_count);
+    ASSERT_EQ(1u, backend.gets.size());
+    EXPECT_EQ(floor_key, backend.gets[0]);
+    EXPECT_FALSE(backend.values.contains(BuildBatchRecordKey("cluster", 10)));
+    EXPECT_TRUE(backend.values.contains(BuildBatchRecordKey("cluster", 20)));
+}
+
+TEST_F(PruningTest, ResumeAbsentFloorAndStrictFloorParsing) {
+    bool more = true;
+    EXPECT_EQ(ErrorCode::OK, pruning.Resume(*lease, {}, &more));
+    EXPECT_FALSE(more);
+    EXPECT_EQ(0u, backend.range_count);
+    for (const auto& value :
+         {"", "-1", "+1", " 1", "1x", "18446744073709551616"}) {
+        backend.values[floor_key] = value;
+        EXPECT_EQ(ErrorCode::INTERNAL_ERROR, pruning.Resume(*lease));
+    }
+    EXPECT_EQ(0u, backend.delete_count);
+}
+
+TEST_F(PruningTest, ResumeDeletesZeroAndMaxIdWhileProtectingOtherNamespaces) {
+    SetBatches({0, UINT64_MAX - 1, UINT64_MAX});
+    backend.values[floor_key] = std::to_string(UINT64_MAX);
+    const auto other = BuildBatchRecordKey("other", 0);
+    const auto control = BuildDurablePrefixKey("cluster");
+    backend.Put(other, "other");
+    backend.Put(control, "durable");
+    BatchOpLogPruningCoordinator bounded(
+        backend, store, "cluster", "snapshots",
+        {.max_batches_per_request = 2, .batch_interval_ms = 0});
+    bool more = true;
+    EXPECT_EQ(ErrorCode::OK, bounded.Resume(*lease, {}, &more));
+    EXPECT_FALSE(more);
+    ASSERT_EQ(2u, backend.deleted_counts.size());
+    EXPECT_EQ(2u, backend.deleted_counts[0]);
+    EXPECT_EQ(1u, backend.deleted_counts[1]);
+    EXPECT_TRUE(backend.values.contains(other));
+    EXPECT_TRUE(backend.values.contains(control));
+    EXPECT_TRUE(backend.values.contains(latest_key));
+    EXPECT_TRUE(backend.values.contains(lock_key));
+}
+
+TEST_F(PruningTest, QueriesActualOldestKeysAcrossLargeHoles) {
+    SetBatches({2, 1000000, 9000000000000ULL});
+    backend.values[floor_key] = "9000000000000";
+    BatchOpLogPruningCoordinator bounded(
+        backend, store, "cluster", "snapshots",
+        {.max_batches_per_request = 2, .batch_interval_ms = 0});
+    bool more = true;
+    ASSERT_EQ(ErrorCode::OK, bounded.Resume(*lease, {}, &more));
+    EXPECT_FALSE(more);
+    ASSERT_EQ(2u, backend.delete_ranges.size());
+    EXPECT_EQ(BuildBatchRecordKey("cluster", 2),
+              backend.delete_ranges[0].first);
+    EXPECT_EQ(BuildBatchRecordKey("cluster", 1000001),
+              backend.delete_ranges[0].second);
+    EXPECT_EQ(BuildBatchRecordKey("cluster", 9000000000000ULL),
+              backend.delete_ranges[1].first);
+    EXPECT_EQ(3u, backend.range_count);
+}
+
+TEST_F(PruningTest, PartialFailureResumesOldestRemainingWithoutFloorAdvance) {
+    SetBatches({1, 2, 3, 4, 5});
+    BatchOpLogPruningCoordinator bounded(
+        backend, store, "cluster", "snapshots",
+        {.max_batches_per_request = 2, .batch_interval_ms = 0});
+    backend.before_delete = [&] {
+        if (backend.delete_count == 2)
+            backend.delete_error = ErrorCode::ETCD_OPERATION_ERROR;
+    };
+    bool more = false;
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, bounded.Run(*lease, {}, &more));
+    EXPECT_TRUE(more);
+    EXPECT_EQ("10", backend.values[floor_key]);
+    EXPECT_FALSE(backend.values.contains(BuildBatchRecordKey("cluster", 1)));
+    EXPECT_TRUE(backend.values.contains(BuildBatchRecordKey("cluster", 3)));
+    backend.before_delete = {};
+    backend.delete_error = ErrorCode::OK;
+    EXPECT_EQ(ErrorCode::OK, bounded.Resume(*lease, {}, &more));
+    EXPECT_FALSE(more);
+    EXPECT_EQ(1u, backend.txn_count);
+    ASSERT_EQ(4u, backend.delete_ranges.size());
+    EXPECT_EQ(backend.delete_ranges[1], backend.delete_ranges[2]);
+}
+
+TEST_F(PruningTest, UnknownDeleteOutcomeRequeriesInsteadOfReplayingOldRange) {
+    SetBatches({1, 2, 3});
+    backend.values[floor_key] = "10";
+    BatchOpLogPruningCoordinator bounded(
+        backend, store, "cluster", "snapshots",
+        {.max_batches_per_request = 2, .batch_interval_ms = 0});
+    backend.delete_error = ErrorCode::ETCD_OPERATION_ERROR;
+    backend.apply_on_delete_error = true;
+    bool more = false;
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR,
+              bounded.Resume(*lease, {}, &more));
+    EXPECT_TRUE(more);
+    backend.delete_error = ErrorCode::OK;
+    EXPECT_EQ(ErrorCode::OK, bounded.Resume(*lease, {}, &more));
+    EXPECT_FALSE(more);
+    ASSERT_EQ(2u, backend.delete_ranges.size());
+    EXPECT_EQ(BuildBatchRecordKey("cluster", 3),
+              backend.delete_ranges[1].first);
+}
+
+TEST_F(PruningTest, RejectsInvalidKeyPagesBeforeDeletingAnything) {
+    backend.values[floor_key] = "10";
+    const std::vector<std::vector<std::string>> pages = {
+        {BuildBatchRecordKey("other", 1)},
+        {BuildBatchRecordKey("cluster", 11)},
+        {BuildBatchRecordKey("cluster", 2), BuildBatchRecordKey("cluster", 1)},
+        {BuildBatchRecordKey("cluster", 1), BuildBatchRecordKey("cluster", 1)},
+        {"/oplog/cluster/batches/not-a-batch"},
+        {BuildBatchRecordKey("cluster", 1) + "extra"},
+        {BuildBatchRecordKey("cluster", 1), BuildBatchRecordKey("cluster", 2),
+         BuildBatchRecordKey("cluster", 3)}};
+    BatchOpLogPruningCoordinator bounded(
+        backend, store, "cluster", "snapshots",
+        {.max_batches_per_request = 2, .batch_interval_ms = 0});
+    for (const auto& page : pages) {
+        backend.mutate_range_results = [&](auto& keys) { keys = page; };
+        bool more = false;
+        EXPECT_EQ(ErrorCode::INTERNAL_ERROR, bounded.Resume(*lease, {}, &more));
+        EXPECT_TRUE(more);
+        EXPECT_EQ(0u, backend.delete_count);
+    }
+}
+
+TEST_F(PruningTest, FailedKeysOnlyQueryRetainsWorkAndDoesNotDelete) {
+    backend.values[floor_key] = "10";
+    backend.range_error = ErrorCode::ETCD_OPERATION_ERROR;
+    bool more = false;
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR,
+              pruning.Resume(*lease, {}, &more));
+    EXPECT_TRUE(more);
+    EXPECT_EQ(0u, backend.delete_count);
+}
+
+TEST_F(PruningTest, CancellationAfterRangeDoesNotIssueDelete) {
+    backend.values[floor_key] = "10";
+    bool cancelled = false;
+    backend.after_range = [&] { cancelled = true; };
+    bool more = false;
+    EXPECT_EQ(ErrorCode::OK,
+              pruning.Resume(*lease, [&] { return cancelled; }, &more));
+    EXPECT_TRUE(more);
+    EXPECT_EQ(0u, backend.delete_count);
+}
+
+TEST_F(PruningTest, LeaseLossBetweenChunksStopsImmediately) {
+    SetBatches({1, 2, 3});
+    backend.values[floor_key] = "10";
+    backend.after_delete = [&] { EXPECT_EQ(ErrorCode::OK, lease->Release()); };
+    BatchOpLogPruningCoordinator bounded(
+        backend, store, "cluster", "snapshots",
+        {.max_batches_per_request = 1, .batch_interval_ms = 1000});
+    const auto start = std::chrono::steady_clock::now();
+    bool more = false;
+    EXPECT_EQ(ErrorCode::OK, bounded.Resume(*lease, {}, &more));
+    EXPECT_LT(std::chrono::steady_clock::now() - start,
+              std::chrono::milliseconds(500));
+    EXPECT_TRUE(more);
+    EXPECT_EQ(1u, backend.delete_count);
+    EXPECT_EQ(1u, backend.range_count);
+}
+
+TEST_F(PruningTest, CancellationIsObservedDuringTheBatchInterval) {
+    SetBatches({1, 2});
+    backend.values[floor_key] = "10";
+    bool applied = false;
+    size_t interval_checks = 0;
+    backend.after_delete = [&] { applied = true; };
+    BatchOpLogPruningCoordinator bounded(
+        backend, store, "cluster", "snapshots",
+        {.max_batches_per_request = 1, .batch_interval_ms = 1000});
+    bool more = false;
+    EXPECT_EQ(
+        ErrorCode::OK,
+        bounded.Resume(
+            *lease, [&] { return applied && ++interval_checks == 3; }, &more));
+    EXPECT_TRUE(more);
+    EXPECT_EQ(3u, interval_checks);
+    EXPECT_EQ(1u, backend.delete_count);
+    EXPECT_EQ(1u, backend.range_count);
+}
+
+TEST_F(PruningTest, EachPassIsBoundedAndContinuationDoesNotNeedNewSnapshot) {
+    SetBatches({});
+    for (uint64_t id = 0; id < 33; ++id)
+        backend.Put(BuildBatchRecordKey("cluster", id), "batch");
+    backend.values[floor_key] = "32";
+    BatchOpLogPruningCoordinator bounded(
+        backend, store, "cluster", "snapshots",
+        {.max_batches_per_request = 2, .batch_interval_ms = 0});
+    bool more = false;
+    EXPECT_EQ(ErrorCode::OK, bounded.Resume(*lease, {}, &more));
+    EXPECT_TRUE(more);
+    EXPECT_EQ(16u, backend.delete_count);
+    EXPECT_EQ(16u, backend.range_count);
+    EXPECT_EQ(ErrorCode::OK, bounded.Resume(*lease, {}, &more));
+    EXPECT_FALSE(more);
+    EXPECT_EQ(17u, backend.delete_count);
+    EXPECT_EQ(0u, backend.txn_count);
+}
+
+TEST_F(PruningTest, SlowEnumerationStillAllowsOneChunkToMakeProgress) {
+    SetBatches({1, 2});
+    backend.values[floor_key] = "10";
+    backend.before_range = [] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    };
+    BatchOpLogPruningCoordinator bounded(
+        backend, store, "cluster", "snapshots",
+        {.max_batches_per_request = 1, .batch_interval_ms = 0});
+    bool more = false;
+    EXPECT_EQ(ErrorCode::OK, bounded.Resume(*lease, {}, &more));
+    EXPECT_TRUE(more);
+    EXPECT_EQ(1u, backend.range_count);
+    EXPECT_EQ(1u, backend.delete_count);
+    EXPECT_FALSE(backend.values.contains(BuildBatchRecordKey("cluster", 1)));
+    EXPECT_TRUE(backend.values.contains(BuildBatchRecordKey("cluster", 2)));
+}
+
+TEST_F(PruningTest, InvalidConfigurationAndWrongNamespaceFailClosed) {
+    for (const size_t limit :
+         {size_t{0},
+          static_cast<size_t>(std::numeric_limits<int>::max()) + 1}) {
+        BatchOpLogPruningCoordinator invalid(
+            backend, store, "cluster", "snapshots",
+            {.max_batches_per_request = limit, .batch_interval_ms = 0});
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, invalid.Run(*lease));
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, invalid.Resume(*lease));
+    }
+    BatchOpLogPruningCoordinator wrong_namespace(backend, store, "other",
+                                                 "snapshots");
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, wrong_namespace.Resume(*lease));
+    BatchOpLogPruningCoordinator huge_interval(
+        backend, store, "cluster", "snapshots",
+        {.max_batches_per_request = 1,
+         .batch_interval_ms =
+             uint64_t{std::numeric_limits<uint32_t>::max()} + 1});
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, huge_interval.Run(*lease));
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, huge_interval.Resume(*lease));
+    EXPECT_EQ(0u, backend.txn_count);
+    EXPECT_EQ(0u, backend.delete_count);
+}
+
 #ifdef STORE_USE_ETCD
 TEST(PruningRealEtcdTest, FloorPrecedesInclusiveDeleteAndProtectsControlKeys) {
-    constexpr char endpoints[] = "127.0.0.1:2379";
+    const char* endpoints = std::getenv("MOONCAKE_TEST_ETCD_ENDPOINTS");
+    if (endpoints == nullptr && std::getenv("CI") != nullptr) {
+        endpoints = "http://127.0.0.1:2379";
+    }
+    if (endpoints == nullptr)
+        GTEST_SKIP() << "Set MOONCAKE_TEST_ETCD_ENDPOINTS for isolated etcd";
     ASSERT_EQ(ErrorCode::OK, EtcdHelper::ConnectToEtcdStoreClient(endpoints));
-    const std::string cluster = "n12-test-" + std::to_string(getpid());
+    const std::string cluster = "bounded-pruning-" + std::to_string(getpid());
     EtcdHaKvBackend backend;
     const std::string root = "/oplog/" + cluster + "/";
     std::string ignored;
     const auto probe = backend.Get(root + "probe", ignored);
-    if (probe != ErrorCode::OK && probe != ErrorCode::ETCD_KEY_NOT_EXIST)
-        GTEST_SKIP() << "etcd is not reachable at " << endpoints;
+    ASSERT_TRUE(probe == ErrorCode::OK ||
+                probe == ErrorCode::ETCD_KEY_NOT_EXIST)
+        << "etcd is not reachable at " << endpoints;
     ASSERT_EQ(ErrorCode::OK, backend.DeleteRange(root, root + "\xff"));
     SnapshotMaintenanceLease lease(cluster);
     ASSERT_EQ(ErrorCode::OK, lease.Acquire());
@@ -478,7 +823,9 @@ TEST(PruningRealEtcdTest, FloorPrecedesInclusiveDeleteAndProtectsControlKeys) {
     ASSERT_EQ(ErrorCode::OK,
               backend.Put(BuildDurablePrefixKey(cluster), "durable"));
     ASSERT_EQ(ErrorCode::OK, backend.Put(BuildProducerViewKey(cluster), "7"));
-    BatchOpLogPruningCoordinator pruning(backend, store, cluster, "snapshots");
+    BatchOpLogPruningCoordinator pruning(
+        backend, store, cluster, "snapshots",
+        {.max_batches_per_request = 2, .batch_interval_ms = 0});
     ASSERT_EQ(ErrorCode::OK, pruning.Run(lease));
     ASSERT_EQ(
         ErrorCode::OK,
