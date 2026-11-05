@@ -424,7 +424,9 @@ HA leadership and metadata replication are configured separately:
 
 - `--enable_oplog`: Enable the primary OpLog writer and standby reader. Defaults to `false`.
 - `--enable_oplog_snapshot`: Enable standby-generated snapshots for batch OpLog recovery. Defaults to `false`; requires `enable_oplog=true`, HA with etcd, a valid snapshot object store, and a persistent `MOONCAKE_SNAPSHOT_LOCAL_PATH` when using `local`.
-- With `enable_oplog_snapshot=true`, each successful publication also attempts batch OpLog pruning under the same maintenance lease. Pruning requires two independently validated snapshots: it publishes a monotonic `compaction_floor` at the fallback snapshot's batch ID before deleting covered batches. The first snapshot does not prune. GC or pruning failures keep the published snapshot successful; failed deletions can be retried after a later successful publication.
+- With `enable_oplog_snapshot=true`, each successful publication also attempts batch OpLog pruning under the same maintenance lease. Pruning requires two independently validated snapshots: it publishes a monotonic `compaction_floor` at the fallback snapshot's batch ID before deleting covered batches. The first snapshot does not prune. Physical deletion uses serial, bounded requests with a configurable delay between requests. The floor is a safe deletion boundary, not proof that physical deletion has finished. GC or pruning failures keep the published snapshot successful; remaining batches are retried under the maintenance lease even when no new PUT or snapshot is produced. Loss of the lease, promotion, or shutdown stops further requests; completed deletions need no rollback.
+- `--oplog_prune_max_batches_per_request`: Maximum stored OpLog **batch keys** covered by one physical delete request. Defaults to `4096`; must be between `1` and `INT_MAX` when batch OpLog snapshots are enabled. This unit is distinct from business objects, OpLog entries, writer batch size, and pending-entry capacity.
+- `--oplog_prune_batch_interval_ms`: Additional delay between serial prune requests, in milliseconds. Defaults to `20`; `0` removes the extra delay while preserving the per-request key limit. A key-count limit and pacing reduce concentrated deletion work but do not guarantee a maximum etcd request latency. Tune them using observed delete latency and sustained cleanup progress, so deletable history does not accumulate across snapshot cycles.
 - Before enabling this mode, every standby that may be promoted must support compaction-floor rebootstrap. Once pruning has started, rollback requires a binary that understands the batch snapshot and floor protocol. This maintenance does not perform etcd MVCC compaction/defragmentation or delete legacy snapshot/OpLog data.
 - `--snapshot_chunk_object_count`: Maximum objects written to one batch OpLog snapshot chunk. Defaults to `1000000`; must be greater than zero when `enable_oplog_snapshot=true`.
 - `--oplog_poll_interval_ms`: Base polling and retry delay for the batch standby, in milliseconds.
@@ -439,6 +441,8 @@ ha_backend_type: "etcd"
 enable_oplog: true
 enable_oplog_snapshot: true
 snapshot_chunk_object_count: 1000000
+oplog_prune_max_batches_per_request: 4096
+oplog_prune_batch_interval_ms: 20
 snapshot_interval_seconds: 600
 snapshot_object_store_type: "local"
 ```
@@ -855,6 +859,8 @@ mooncake_master \
 | `--enable_oplog` | `false` | Enable the batch OpLog writer and reader; requires `enable_ha=true` and `ha_backend_type=etcd` or `redis`. etcd uses it for Primary-Standby promotion. Redis uses it as an experimental HA log store: a successful write only means Redis accepted the record |
 | `--enable_oplog_snapshot` | `false` | Enable standby-generated batch OpLog snapshots; requires batch OpLog, HA/etcd, valid object-store configuration, and persistent local snapshot storage when applicable |
 | `--snapshot_chunk_object_count` | `1000000` | Maximum objects per batch OpLog snapshot chunk; must be positive when the new snapshot path is enabled |
+| `--oplog_prune_max_batches_per_request` | `4096` | Maximum stored OpLog batch keys per physical prune request; independent of writer and pending-entry limits |
+| `--oplog_prune_batch_interval_ms` | `20` | Additional delay between serial prune requests; `0` disables this delay, not the key limit |
 | `--oplog_poll_interval_ms` | `1000` | Base polling and retry delay for the batch standby, in milliseconds |
 | `--oplog_batch_max_entries` | `1024` | Maximum number of entries admitted to an ordered batch |
 | `--batch_oplog_retry_timeout_sec` | `180` | Maximum consecutive retryable batch-standby failure window in seconds |

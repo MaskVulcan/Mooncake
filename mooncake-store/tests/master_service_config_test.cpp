@@ -6,6 +6,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <limits>
 
 #include "../src/config/metrics_bootstrap_config_loader.h"
 #include "default_config.h"
@@ -152,6 +153,73 @@ TEST(MasterServiceConfigTest, OplogBatchMaxEntriesDefaultsTo1024) {
 
     MasterServiceConfig service_config;
     EXPECT_EQ(1024u, service_config.oplog_batch_max_entries);
+}
+
+TEST(MasterServiceConfigTest, PruneDefaultsAreIndependentOfWriterLimits) {
+    MasterConfig master_config;
+    EXPECT_EQ(4096u, master_config.oplog_prune_max_batches_per_request);
+    EXPECT_EQ(20u, master_config.oplog_prune_batch_interval_ms);
+
+    MasterServiceConfig service_config;
+    EXPECT_EQ(4096u, service_config.oplog_prune_max_batches_per_request);
+    EXPECT_EQ(20u, service_config.oplog_prune_batch_interval_ms);
+
+    const auto built_config = MasterServiceConfig::builder().build();
+    EXPECT_EQ(4096u, built_config.oplog_prune_max_batches_per_request);
+    EXPECT_EQ(20u, built_config.oplog_prune_batch_interval_ms);
+}
+
+TEST(MasterServiceConfigTest, PruneOverridesPropagateThroughHaAndDirectPaths) {
+    MasterConfig master_config{};
+    master_config.oplog_prune_max_batches_per_request = 8192;
+    master_config.oplog_prune_batch_interval_ms = 50;
+    master_config.oplog_batch_max_entries = 3072;
+    MasterServiceSupervisorConfig supervisor_config(master_config);
+    EXPECT_EQ(8192u, supervisor_config.oplog_prune_max_batches_per_request);
+    EXPECT_EQ(50u, supervisor_config.oplog_prune_batch_interval_ms);
+    for (const auto& wrapped_config : {
+             WrappedMasterServiceConfig(supervisor_config, 1),
+             WrappedMasterServiceConfig(master_config, 1),
+         }) {
+        EXPECT_EQ(8192u, wrapped_config.oplog_prune_max_batches_per_request);
+        EXPECT_EQ(50u, wrapped_config.oplog_prune_batch_interval_ms);
+        const MasterServiceConfig service_config(wrapped_config);
+        EXPECT_EQ(8192u, service_config.oplog_prune_max_batches_per_request);
+        EXPECT_EQ(50u, service_config.oplog_prune_batch_interval_ms);
+        EXPECT_EQ(3072u, service_config.oplog_batch_max_entries);
+    }
+}
+
+TEST(MasterServiceConfigTest, PruneBuilderCanDisableAdditionalPacing) {
+    const auto config = MasterServiceConfig::builder()
+                            .set_oplog_prune_max_batches_per_request(8192)
+                            .set_oplog_prune_batch_interval_ms(0)
+                            .build();
+    EXPECT_EQ(8192u, config.oplog_prune_max_batches_per_request);
+    EXPECT_EQ(0u, config.oplog_prune_batch_interval_ms);
+    EXPECT_EQ(1024u, config.oplog_batch_max_entries);
+}
+
+TEST(MasterServiceConfigTest, PruneRequestLimitMustFitBackendWhenEnabled) {
+    MasterConfig config{};
+    config.oplog_prune_max_batches_per_request = 0;
+    EXPECT_FALSE(ValidateBatchOpLogSnapshotConfig(config).has_value());
+    config.enable_oplog_snapshot = true;
+    config.enable_oplog = true;
+    config.enable_ha = true;
+    config.ha_backend_type = "etcd";
+    config.cluster_id = "prune-config-test";
+    config.snapshot_object_store_type = "local";
+    EXPECT_TRUE(ValidateBatchOpLogSnapshotConfig(config).has_value());
+
+    config.oplog_prune_max_batches_per_request = 1;
+    config.oplog_prune_batch_interval_ms = 0;
+    EXPECT_FALSE(ValidateBatchOpLogSnapshotConfig(config).has_value());
+    config.oplog_prune_max_batches_per_request =
+        static_cast<uint32_t>(std::numeric_limits<int>::max());
+    EXPECT_FALSE(ValidateBatchOpLogSnapshotConfig(config).has_value());
+    ++config.oplog_prune_max_batches_per_request;
+    EXPECT_TRUE(ValidateBatchOpLogSnapshotConfig(config).has_value());
 }
 
 TEST(MasterServiceConfigTest, OplogIsDisabledByDefault) {

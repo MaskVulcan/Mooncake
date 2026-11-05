@@ -130,6 +130,9 @@ struct MasterConfig {
     uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
+    // Physical pruning counts stored OpLog batch keys, not entries or objects.
+    uint32_t oplog_prune_max_batches_per_request = 4096;
+    uint32_t oplog_prune_batch_interval_ms = 20;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     uint32_t batch_oplog_retry_timeout_sec = 180;
@@ -267,6 +270,9 @@ class MasterServiceSupervisorConfig {
     uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
+    // Physical pruning counts stored OpLog batch keys, not entries or objects.
+    uint32_t oplog_prune_max_batches_per_request = 4096;
+    uint32_t oplog_prune_batch_interval_ms = 20;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     uint32_t batch_oplog_retry_timeout_sec = 180;
@@ -407,6 +413,9 @@ class MasterServiceSupervisorConfig {
         weight_import_idle_timeout_ms = config.weight_import_idle_timeout_ms;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
+        oplog_prune_max_batches_per_request =
+            config.oplog_prune_max_batches_per_request;
+        oplog_prune_batch_interval_ms = config.oplog_prune_batch_interval_ms;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec;
@@ -590,6 +599,9 @@ class WrappedMasterServiceConfig {
     uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
+    // Physical pruning counts stored OpLog batch keys, not entries or objects.
+    uint32_t oplog_prune_max_batches_per_request = 4096;
+    uint32_t oplog_prune_batch_interval_ms = 20;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -688,6 +700,9 @@ class WrappedMasterServiceConfig {
         weight_import_idle_timeout_ms = config.weight_import_idle_timeout_ms;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
+        oplog_prune_max_batches_per_request =
+            config.oplog_prune_max_batches_per_request;
+        oplog_prune_batch_interval_ms = config.oplog_prune_batch_interval_ms;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
@@ -814,6 +829,9 @@ class WrappedMasterServiceConfig {
         weight_import_idle_timeout_ms = config.weight_import_idle_timeout_ms;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
+        oplog_prune_max_batches_per_request =
+            config.oplog_prune_max_batches_per_request;
+        oplog_prune_batch_interval_ms = config.oplog_prune_batch_interval_ms;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
@@ -882,6 +900,8 @@ class MasterServiceConfigBuilder {
     uint64_t weight_import_idle_timeout_ms_ = 5 * 60 * 1000;
     bool enable_oplog_snapshot_ = false;
     uint64_t snapshot_chunk_object_count_ = 1000000;
+    uint32_t oplog_prune_max_batches_per_request_ = 4096;
+    uint32_t oplog_prune_batch_interval_ms_ = 20;
     int oplog_poll_interval_ms_ = 1000;
     uint32_t oplog_batch_max_entries_ = 1024;
     uint64_t restore_repair_durable_timeout_ms_ =
@@ -1050,6 +1070,18 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_snapshot_chunk_object_count(
         uint64_t count) {
         snapshot_chunk_object_count_ = count;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_prune_max_batches_per_request(
+        uint32_t batches) {
+        oplog_prune_max_batches_per_request_ = batches;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_prune_batch_interval_ms(
+        uint32_t interval_ms) {
+        oplog_prune_batch_interval_ms_ = interval_ms;
         return *this;
     }
 
@@ -1259,6 +1291,9 @@ class MasterServiceConfig {
     uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
+    // Physical pruning counts stored OpLog batch keys, not entries or objects.
+    uint32_t oplog_prune_max_batches_per_request = 4096;
+    uint32_t oplog_prune_batch_interval_ms = 20;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     uint64_t restore_repair_durable_timeout_ms =
@@ -1353,6 +1388,9 @@ class MasterServiceConfig {
         weight_import_idle_timeout_ms = config.weight_import_idle_timeout_ms;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
+        oplog_prune_max_batches_per_request =
+            config.oplog_prune_max_batches_per_request;
+        oplog_prune_batch_interval_ms = config.oplog_prune_batch_interval_ms;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
@@ -1429,6 +1467,9 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.weight_import_idle_timeout_ms = weight_import_idle_timeout_ms_;
     config.enable_oplog_snapshot = enable_oplog_snapshot_;
     config.snapshot_chunk_object_count = snapshot_chunk_object_count_;
+    config.oplog_prune_max_batches_per_request =
+        oplog_prune_max_batches_per_request_;
+    config.oplog_prune_batch_interval_ms = oplog_prune_batch_interval_ms_;
     config.oplog_poll_interval_ms = oplog_poll_interval_ms_;
     config.oplog_batch_max_entries = oplog_batch_max_entries_;
     config.restore_repair_durable_timeout_ms =

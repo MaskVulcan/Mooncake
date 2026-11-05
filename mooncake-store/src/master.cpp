@@ -391,6 +391,12 @@ DEFINE_uint64(weight_import_idle_timeout_ms, 5 * 60 * 1000,
               "without accepted member writes");
 DEFINE_uint64(snapshot_chunk_object_count, 1000000,
               "Maximum objects per standby batch OpLog snapshot chunk");
+DEFINE_uint32(oplog_prune_max_batches_per_request, 4096,
+              "Maximum stored OpLog batch keys per physical prune request; "
+              "must be between 1 and INT_MAX when OpLog snapshots are enabled");
+DEFINE_uint32(oplog_prune_batch_interval_ms, 20,
+              "Delay between serial OpLog prune requests in milliseconds; "
+              "0 disables pacing, not the per-request key limit");
 DEFINE_uint64(snapshot_interval_seconds, 600,
               "Interval between standby batch OpLog snapshots in seconds");
 DEFINE_string(snapshot_object_store_type, "",
@@ -699,6 +705,12 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("snapshot_chunk_object_count",
                              &master_config.snapshot_chunk_object_count,
                              FLAGS_snapshot_chunk_object_count);
+    default_config.GetUInt32("oplog_prune_max_batches_per_request",
+                             &master_config.oplog_prune_max_batches_per_request,
+                             FLAGS_oplog_prune_max_batches_per_request);
+    default_config.GetUInt32("oplog_prune_batch_interval_ms",
+                             &master_config.oplog_prune_batch_interval_ms,
+                             FLAGS_oplog_prune_batch_interval_ms);
     default_config.GetUInt64("snapshot_interval_seconds",
                              &master_config.snapshot_interval_seconds, 600);
     default_config.GetString("snapshot_object_store_type",
@@ -1184,6 +1196,20 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.snapshot_chunk_object_count =
             FLAGS_snapshot_chunk_object_count;
+    }
+    if ((google::GetCommandLineFlagInfo("oplog_prune_max_batches_per_request",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.oplog_prune_max_batches_per_request =
+            FLAGS_oplog_prune_max_batches_per_request;
+    }
+    if ((google::GetCommandLineFlagInfo("oplog_prune_batch_interval_ms",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.oplog_prune_batch_interval_ms =
+            FLAGS_oplog_prune_batch_interval_ms;
     }
     if ((google::GetCommandLineFlagInfo("snapshot_interval_seconds", &info) &&
          !info.is_default) ||

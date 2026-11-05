@@ -1,5 +1,6 @@
 #include "ha/standby_controller.h"
 
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -123,10 +124,14 @@ class CapabilityDrivenStandbyController final : public StandbyController {
             try {
                 if (spec_.type != HABackendType::ETCD ||
                     !capabilities_.has_oplog_following ||
-                    config_.snapshot_chunk_object_count == 0) {
+                    config_.snapshot_chunk_object_count == 0 ||
+                    config_.oplog_prune_max_batches_per_request == 0 ||
+                    config_.oplog_prune_max_batches_per_request >
+                        static_cast<uint32_t>(
+                            std::numeric_limits<int>::max())) {
                     throw std::invalid_argument(
-                        "batch snapshot requires etcd OpLog and positive chunk "
-                        "count");
+                        "batch snapshot requires etcd OpLog, positive chunk "
+                        "count, and prune request count between 1 and INT_MAX");
                 }
                 batch_backend_ = std::make_unique<EtcdHaKvBackend>();
                 auto type = ParseSnapshotObjectStoreType(
@@ -142,18 +147,25 @@ class CapabilityDrivenStandbyController final : public StandbyController {
                     std::make_unique<BatchOpLogSnapshotProvider>(
                         config_.cluster_id, *batch_backend_,
                         *snapshot_object_store_, snapshot_root));
-                batch_oplog_snapshot_coordinator_ =
-                    std::make_unique<BatchOpLogSnapshotCoordinator>(
-                        *standby_service_, *batch_backend_,
-                        *snapshot_object_store_, config_.cluster_id,
-                        BatchOpLogSnapshotCoordinatorConfig{
-                            .snapshot_interval_seconds =
-                                config_.snapshot_interval_seconds,
-                            .chunk_object_count =
-                                config_.snapshot_chunk_object_count,
-                            .snapshot_root = snapshot_root,
-                            .clock = {},
-                        });
+                batch_oplog_snapshot_coordinator_ = std::make_unique<
+                    BatchOpLogSnapshotCoordinator>(
+                    *standby_service_, *batch_backend_, *snapshot_object_store_,
+                    config_.cluster_id,
+                    BatchOpLogSnapshotCoordinatorConfig{
+                        .snapshot_interval_seconds =
+                            config_.snapshot_interval_seconds,
+                        .chunk_object_count =
+                            config_.snapshot_chunk_object_count,
+                        .snapshot_root = snapshot_root,
+                        .clock = {},
+                        .pruning =
+                            {
+                                .max_batches_per_request =
+                                    config_.oplog_prune_max_batches_per_request,
+                                .batch_interval_ms =
+                                    config_.oplog_prune_batch_interval_ms,
+                            },
+                    });
             } catch (const std::exception& e) {
                 throw std::runtime_error(
                     std::string("Failed to initialize batch OpLog snapshot: ") +

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <limits>
 #include <optional>
 #include <string>
 
@@ -22,6 +23,12 @@ inline std::optional<std::string> ValidateBatchOpLogSnapshotConfig(
     }
     if (config.snapshot_chunk_object_count == 0) {
         return "snapshot_chunk_object_count must be greater than 0";
+    }
+    if (config.oplog_prune_max_batches_per_request == 0 ||
+        config.oplog_prune_max_batches_per_request >
+            static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+        return "oplog_prune_max_batches_per_request must be between 1 and "
+               "INT_MAX";
     }
     if (ha::BuildBatchOpLogSnapshotRoot(config.cluster_id).empty()) {
         return "enable_oplog_snapshot requires a valid cluster_id";
