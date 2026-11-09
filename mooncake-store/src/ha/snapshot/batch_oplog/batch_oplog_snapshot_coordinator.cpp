@@ -252,20 +252,27 @@ bool BatchOpLogSnapshotCoordinator::CatchUpComplete(
     return current && IsAtOrAfter(*current, target);
 }
 
-void BatchOpLogSnapshotCoordinator::FinishAttempt(ErrorCode error,
-                                                  bool count_attempt) {
+void BatchOpLogSnapshotCoordinator::RecordAttemptResult(ErrorCode error,
+                                                        bool count_attempt) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (count_attempt) {
         ++attempts_;
         last_attempt_complete_ = Now();
     }
     last_error_ = error;
-    attempt_in_flight_ = false;
-    capture_active_ = false;
-    cv_.notify_all();
 }
 
 ErrorCode BatchOpLogSnapshotCoordinator::RunOnce() {
+    // Keep the claim until RunAttempt and its local cleanup have unwound.
+    // Only this invocation may release it or record an exception outcome.
+    const auto release_attempt = [](BatchOpLogSnapshotCoordinator* owner) {
+        std::lock_guard<std::mutex> lock(owner->mutex_);
+        owner->attempt_in_flight_ = false;
+        owner->capture_active_ = false;
+        owner->cv_.notify_all();
+    };
+    std::unique_ptr<BatchOpLogSnapshotCoordinator, decltype(release_attempt)>
+        attempt(nullptr, release_attempt);
     try {
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -290,6 +297,8 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunOnce() {
                     Skip::Promotion);
                 return ErrorCode::OK;
             }
+            attempt_in_flight_ = true;
+            attempt.reset(this);
         }
         HAMetricManager::instance().record_snapshot_skip(Skip::None);
         HAMetricManager::SnapshotOperationTimer timer(
@@ -299,11 +308,11 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunOnce() {
         return error;
     } catch (const std::exception& e) {
         LOG(ERROR) << "Batch snapshot coordinator failed: " << e.what();
-        FinishAttempt(ErrorCode::INTERNAL_ERROR, false);
+        if (attempt) RecordAttemptResult(ErrorCode::INTERNAL_ERROR, false);
         return ErrorCode::INTERNAL_ERROR;
     } catch (...) {
         LOG(ERROR) << "Batch snapshot coordinator failed with unknown error";
-        FinishAttempt(ErrorCode::INTERNAL_ERROR, false);
+        if (attempt) RecordAttemptResult(ErrorCode::INTERNAL_ERROR, false);
         return ErrorCode::INTERNAL_ERROR;
     }
 }
@@ -311,30 +320,26 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunOnce() {
 ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
     if (config_.snapshot_root.empty() || config_.chunk_object_count == 0 ||
         !NormalizeAndValidateClusterId(cluster_id_) || cluster_id_.empty()) {
-        FinishAttempt(ErrorCode::INVALID_PARAMS, false);
+        RecordAttemptResult(ErrorCode::INVALID_PARAMS, false);
         return ErrorCode::INVALID_PARAMS;
     }
 
     ErrorCode read_error = ErrorCode::OK;
     const auto latest_batch_id = ReadLatestBatchId(read_error);
     if (!latest_batch_id) {
-        FinishAttempt(read_error, false);
+        RecordAttemptResult(read_error, false);
         return read_error;
     }
     const auto local_prefix = standby_.GetLastAppliedBatchOpLogSnapshotPrefix();
     if (!local_prefix || local_prefix->batch_id <= *latest_batch_id) {
         HAMetricManager::instance().record_snapshot_skip(Skip::NoNewBatch);
-        FinishAttempt(ErrorCode::OK, false);
+        RecordAttemptResult(ErrorCode::OK, false);
         return ErrorCode::OK;
     }
     bool catch_up_blocked = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (attempt_in_flight_) {
-            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
-        }
         catch_up_blocked = catch_up_target_.has_value();
-        attempt_in_flight_ = true;
     }
     if (catch_up_blocked) {
         std::optional<DurablePrefix> target;
@@ -344,7 +349,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         }
         if (target && !CatchUpComplete(*target)) {
             HAMetricManager::instance().record_snapshot_skip(Skip::CatchUp);
-            FinishAttempt(ErrorCode::OK, false);
+            RecordAttemptResult(ErrorCode::OK, false);
             return ErrorCode::OK;
         }
     }
@@ -353,7 +358,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
     if (!lease) {
         HAMetricManager::instance().record_snapshot_skip(Skip::LeaseBusy);
         // A factory may return null to represent a busy maintenance lease.
-        FinishAttempt(ErrorCode::OK, false);
+        RecordAttemptResult(ErrorCode::OK, false);
         return ErrorCode::OK;
     }
     const ErrorCode lease_error =
@@ -365,7 +370,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         const ErrorCode result = lease_error == ErrorCode::ETCD_TRANSACTION_FAIL
                                      ? ErrorCode::OK
                                      : lease_error;
-        FinishAttempt(result, false);
+        RecordAttemptResult(result, false);
         return result;
     }
 
@@ -396,7 +401,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         HAMetricManager::instance().record_snapshot_skip(
             promotion_before_capture ? Skip::Promotion : Skip::Stopped);
         lease_observer.reset();
-        FinishAttempt(ErrorCode::OK, true);
+        RecordAttemptResult(ErrorCode::OK, true);
         return ErrorCode::OK;
     }
 
@@ -410,7 +415,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         const ErrorCode result =
             read_error == ErrorCode::OK ? ErrorCode::OK : read_error;
         lease_observer.reset();
-        FinishAttempt(result, true);
+        RecordAttemptResult(result, true);
         return result;
     }
 
@@ -426,7 +431,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         HAMetricManager::instance().record_snapshot_skip(
             capture ? Skip::NoNewBatch : Skip::CaptureUnavailable);
         lease_observer.reset();
-        FinishAttempt(ErrorCode::OK, true);
+        RecordAttemptResult(ErrorCode::OK, true);
         return ErrorCode::OK;
     }
 
@@ -440,7 +445,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         standby_.CancelBatchOpLogSnapshotCapture();
         standby_.EndBatchOpLogSnapshotCapture(*capture);
         lease_observer.reset();
-        FinishAttempt(ErrorCode::OK, true);
+        RecordAttemptResult(ErrorCode::OK, true);
         return ErrorCode::OK;
     }
 
@@ -467,7 +472,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
     }
     if (!descriptor) {
         lease_observer.reset();
-        FinishAttempt(ErrorCode::INTERNAL_ERROR, true);
+        RecordAttemptResult(ErrorCode::INTERNAL_ERROR, true);
         return ErrorCode::INTERNAL_ERROR;
     }
 
@@ -484,7 +489,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
                          << cleanup.error();
         }
         lease_observer.reset();
-        FinishAttempt(ErrorCode::OK, true);
+        RecordAttemptResult(ErrorCode::OK, true);
         return ErrorCode::OK;
     }
 
@@ -551,7 +556,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         }
     }
     lease_observer.reset();
-    FinishAttempt(publish_error, true);
+    RecordAttemptResult(publish_error, true);
     return publish_error;
 }
 

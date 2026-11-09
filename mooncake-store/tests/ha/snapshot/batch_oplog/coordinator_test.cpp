@@ -5,6 +5,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <future>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -26,6 +28,32 @@
 namespace mooncake::test {
 namespace {
 
+class BackendReadGate {
+   public:
+    void Block() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        entered_ = true;
+        cv_.notify_all();
+        cv_.wait(lock, [this] { return released_; });
+    }
+    bool WaitForEntry() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(5),
+                            [this] { return entered_; });
+    }
+    void Release() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        released_ = true;
+        cv_.notify_all();
+    }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool entered_{false};
+    bool released_{false};
+};
+
 class EmptyBackend final : public HaKvBackend {
    public:
     ErrorCode DeleteRange(std::string_view, std::string_view) override {
@@ -33,6 +61,7 @@ class EmptyBackend final : public HaKvBackend {
     }
 
     ErrorCode Get(std::string_view key, std::string& value) override {
+        if (on_get) return on_get(key, value);
         if (get_error != ErrorCode::OK) return get_error;
         auto it = values.find(std::string(key));
         if (it == values.end()) {
@@ -57,6 +86,7 @@ class EmptyBackend final : public HaKvBackend {
     ErrorCode Txn(const KvTxn&) override { return ErrorCode::OK; }
 
     ErrorCode get_error{ErrorCode::OK};
+    std::function<ErrorCode(std::string_view, std::string&)> on_get;
     std::map<std::string, std::string> values;
 };
 
@@ -300,6 +330,92 @@ TEST(BatchOpLogSnapshotCoordinatorTest, EmptyStandbySkipsWithoutLease) {
     EXPECT_TRUE(coordinator.IsRunning());
     coordinator.Stop();
     EXPECT_FALSE(coordinator.IsRunning());
+}
+
+TEST(BatchOpLogSnapshotCoordinatorTest, InitialReadOwnsAttemptUntilItReturns) {
+    // Exercise normal early return, backend failure, and both exception paths.
+    for (int failure = 0; failure < 4; ++failure) {
+        SCOPED_TRACE(failure);
+        HotStandbyConfig standby_config;
+        standby_config.enable_verification = false;
+        HotStandbyService standby(standby_config);
+        EmptyBackend backend;
+        UnusedObjectStore objects;
+        BackendReadGate gate;
+        std::atomic<int> reads{0};
+        backend.on_get = [&](std::string_view, std::string&) {
+            if (++reads == 1) {
+                gate.Block();
+                if (failure == 1) return ErrorCode::ETCD_OPERATION_ERROR;
+                if (failure == 2)
+                    throw std::runtime_error("initial Get failed");
+                if (failure == 3) throw 42;
+            }
+            return ErrorCode::ETCD_KEY_NOT_EXIST;
+        };
+        BatchOpLogSnapshotCoordinatorConfig config;
+        config.snapshot_root = "snapshots";
+        BatchOpLogSnapshotCoordinator coordinator(standby, backend, objects,
+                                                  "cluster", config);
+        std::promise<ErrorCode> result;
+        auto completed = result.get_future();
+        std::thread attempt([&] { result.set_value(coordinator.RunOnce()); });
+        const bool entered = gate.WaitForEntry();
+        EXPECT_TRUE(entered);
+        if (entered) {
+            EXPECT_TRUE(coordinator.IsAttemptInFlight());
+            EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS,
+                      coordinator.RunOnce());
+            EXPECT_EQ(1, reads.load());
+        }
+        gate.Release();
+        attempt.join();
+        const auto expected = failure >= 2   ? ErrorCode::INTERNAL_ERROR
+                              : failure == 1 ? ErrorCode::ETCD_OPERATION_ERROR
+                                             : ErrorCode::OK;
+        EXPECT_EQ(expected, completed.get());
+        EXPECT_FALSE(coordinator.IsAttemptInFlight());
+        EXPECT_EQ(ErrorCode::OK, coordinator.RunOnce());
+        EXPECT_FALSE(coordinator.IsAttemptInFlight());
+    }
+}
+
+TEST(BatchOpLogSnapshotCoordinatorTest, StopWaitsForInitialReadWithoutWorker) {
+    HotStandbyConfig standby_config;
+    standby_config.enable_verification = false;
+    HotStandbyService standby(standby_config);
+    EmptyBackend backend;
+    UnusedObjectStore objects;
+    BackendReadGate gate;
+    backend.on_get = [&](std::string_view, std::string&) {
+        gate.Block();
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    };
+    BatchOpLogSnapshotCoordinatorConfig config;
+    config.snapshot_root = "snapshots";
+    BatchOpLogSnapshotCoordinator coordinator(standby, backend, objects,
+                                              "cluster", config);
+    std::thread attempt([&] {
+        EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, coordinator.RunOnce());
+    });
+    EXPECT_TRUE(gate.WaitForEntry());
+    std::promise<void> stop_started;
+    auto started = stop_started.get_future();
+    std::promise<void> stopped;
+    auto completed = stopped.get_future();
+    std::thread stopping([&] {
+        stop_started.set_value();
+        coordinator.Stop();
+        stopped.set_value();
+    });
+    started.wait();
+    EXPECT_EQ(std::future_status::timeout,
+              completed.wait_for(std::chrono::milliseconds(50)));
+    gate.Release();
+    attempt.join();
+    stopping.join();
+    EXPECT_FALSE(coordinator.IsAttemptInFlight());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, coordinator.RunOnce());
 }
 
 TEST(BatchOpLogSnapshotCoordinatorTest,
